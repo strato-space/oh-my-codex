@@ -43,6 +43,7 @@ If no flag is provided, use **Standard**.
 - Ask ONE question per round (never batch)
 - Ask about intent and boundaries before implementation detail
 - Target the weakest clarity dimension each round after applying the stage-priority rules below
+- When a key term is overloaded, shifts meaning, or mixes multiple categories, spend the round normalizing that term explicitly before scoring it as clear
 - Treat every answer as a claim to pressure-test before moving on: the next question should usually demand evidence or examples, expose a hidden assumption, force a tradeoff or boundary, or reframe root cause vs symptom
 - Do not rotate to a new clarity dimension just for coverage when the current answer is still vague; stay on the same thread until one layer deeper, one assumption clearer, or one boundary tighter
 - Before crystallizing, complete at least one explicit pressure pass that revisits an earlier answer with a deeper, assumption-focused, or tradeoff-focused follow-up
@@ -53,8 +54,10 @@ If no flag is provided, use **Standard**.
 - For brownfield work, prefer evidence-backed confirmation questions such as "I found X in Y. Should this change follow that pattern?"
 - In Codex CLI, prefer `request_user_input` when available; if unavailable, fall back to concise plain-text one-question turns
 - Re-score ambiguity after each answer and show progress transparently
+- Treat the weighted ambiguity score as an epistemic readiness signal, not the whole truth: final readiness also requires deontic authority clarity and robustness checks
 - Do not hand off to execution while ambiguity remains above threshold unless user explicitly opts to proceed with warning
 - Do not crystallize or hand off while `Non-goals` or `Decision Boundaries` remain unresolved, even if the weighted ambiguity threshold is met
+- If ontology or consistency fails, label the failure (`categorical`, `empirical`, `authority/deontic`, or `logical inconsistency`), state the minimal repair, and keep the workflow narrow rather than broadening into a rewrite
 - Treat early exit as a safety valve, not the default success path
 - Persist mode state for resume safety (`state_write` / `state_read`)
 </Execution_Policy>
@@ -126,11 +129,14 @@ Target the lowest-scoring dimension, but respect stage priority:
 - **Stage 2 — Feasibility:** Constraints, Success Criteria
 - **Stage 3 — Brownfield grounding:** Context Clarity (brownfield only)
 
+If a key term (`scope`, `done`, `success`, `authority`, etc.) is being used loosely, inconsistently, or across multiple categories, use the next round to normalize that term before returning to ordinary scoring.
+
 Follow-up pressure ladder after each answer:
 1. Ask for a concrete example, counterexample, or evidence signal behind the latest claim
 2. Probe the hidden assumption, dependency, or belief that makes the claim true
 3. Force a boundary or tradeoff: what would you explicitly not do, defer, or reject?
-4. If the answer still describes symptoms, reframe toward essence / root cause before moving on
+4. Separate mixed kinds before accepting the answer as clear: epistemic uncertainty, deontic authority, operational feasibility, and evaluative success should not be collapsed into one answer
+5. If the answer still describes symptoms, reframe toward essence / root cause before moving on
 
 Prefer staying on the same thread for multiple rounds when it has the highest leverage. Breadth without pressure is not progress.
 
@@ -160,14 +166,20 @@ Greenfield: `ambiguity = 1 - (intent × 0.30 + outcome × 0.25 + scope × 0.20 +
 
 Brownfield: `ambiguity = 1 - (intent × 0.25 + outcome × 0.20 + scope × 0.20 + constraints × 0.15 + success × 0.10 + context × 0.10)`
 
+Interpret the weighted ambiguity score as an epistemic clarity heuristic. It should not overrule deontic authority failures or robustness failures.
+
 Readiness gate:
+- Split readiness explicitly across: **Epistemic** (`ambiguity` threshold), **Deontic** (`Non-goals`, `Decision Boundaries`, approval boundaries), and **Robustness** (pressure pass, consistency, anti-trivialization)
 - `Non-goals` must be explicit
 - `Decision Boundaries` must be explicit
 - A pressure pass must be complete: at least one earlier answer has been revisited with an evidence, assumption, or tradeoff follow-up
-- If either gate is unresolved, or the pressure pass is incomplete, continue interviewing even when weighted ambiguity is below threshold
+- Run a lightweight consistency pass across intent, scope, non-goals, decision boundaries, and acceptance criteria before crystallizing
+- If clarity improved only by becoming more generic, treat that as `salvage by trivialization` and continue interviewing
+- If ontology fails, label the failure (`categorical`, `empirical`, `authority/deontic`, or `logical inconsistency`), state the minimal repair, and re-score only after the repaired framing is explicit
+- If any readiness lane is unresolved, continue interviewing even when weighted ambiguity is below threshold
 
 ### 2d) Report progress
-Show weighted breakdown table, readiness-gate status (`Non-goals`, `Decision Boundaries`), and the next focus dimension.
+Show weighted breakdown table, readiness-gate status (`Non-goals`, `Decision Boundaries`, `Consistency`, `Anti-trivialization`), and the next focus dimension.
 
 ### 2e) Persist state
 Append round result and updated scores via `state_write`.
@@ -184,7 +196,7 @@ Use each mode once when applicable. These are normal escalation tools, not rare 
 
 - **Contrarian** (round 2+ or immediately when an answer rests on an untested assumption): challenge core assumptions
 - **Simplifier** (round 4+ or when scope expands faster than outcome clarity): probe minimal viable scope
-- **Ontologist** (round 5+ and ambiguity > 0.25, or when the user keeps describing symptoms): ask for essence-level reframing
+- **Ontologist** (round 5+ and ambiguity > 0.25, or when the user keeps describing symptoms): ask for essence-level reframing and check for category mistakes or epistemic/deontic/operational collapse
 
 Track used modes in state to prevent repetition.
 
@@ -202,6 +214,8 @@ Spec should include:
 - Metadata (profile, rounds, final ambiguity, threshold, context type)
 - Context snapshot reference/path (for ralplan/team reuse)
 - Clarity breakdown table
+- Key term normalizations (only when terms were overloaded, shifted, or mixed across categories)
+- Readiness split summary: **Epistemic** (`ambiguity` signal), **Deontic** (authority / confirmation boundaries), **Robustness** (pressure pass, consistency, anti-trivialization)
 - Intent (why the user wants this)
 - Desired Outcome
 - In-Scope
@@ -211,6 +225,11 @@ Spec should include:
 - Testable acceptance criteria
 - Assumptions exposed + resolutions
 - Pressure-pass findings (which answer was revisited, and what changed)
+- Consistency findings across intent / scope / non-goals / decision boundaries / acceptance criteria
+- Anti-trivialization findings (`salvage by trivialization` or explicit note that no such collapse was detected)
+- Failure labels + minimal repairs (when ontology, authority, or consistency failed during the interview)
+- Modal summary: Known / unknown, Allowed without confirmation / requires confirmation, Feasible now / blocked, Must-have / nice-to-have
+- Established facts vs open hypotheses
 - Brownfield evidence vs inference notes for any repository-grounded confirmation questions
 - Technical context findings
 - Full or condensed transcript
