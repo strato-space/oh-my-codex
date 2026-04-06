@@ -57,9 +57,9 @@ describe("deep-interview Ouroboros contract", () => {
 		assert.match(deepInterviewSkill, /Desired Outcome/i);
 		assert.match(deepInterviewSkill, /Out-of-Scope \/ Non-goals/i);
 		assert.match(deepInterviewSkill, /Decision Boundaries/i);
-		assert.match(deepInterviewSkill, /epistemic readiness signal/i);
-		assert.match(deepInterviewSkill, /deontic authority clarity/i);
-		assert.match(deepInterviewSkill, /robustness checks/i);
+		assert.match(deepInterviewSkill, /Treat the weighted ambiguity score as epistemic only/i);
+		assert.match(deepInterviewSkill, /deontic clarity/i);
+		assert.match(deepInterviewSkill, /completed pressure pass/i);
 		assert.match(deepInterviewSkill, /Reduce user effort/i);
 		assert.match(deepInterviewSkill, /must be explicit/i);
 		assert.match(deepInterviewSkill, /pressure pass/i);
@@ -128,7 +128,7 @@ describe("deep-interview Ouroboros contract", () => {
 		);
 		assert.match(
 			deepInterviewSkill,
-			/category mistakes or epistemic\/deontic\/operational collapse/i,
+			/validate ontology first, checking for category mistake or conflict with real examples/i,
 		);
 		assert.match(
 			deepInterviewSkill,
@@ -139,7 +139,7 @@ describe("deep-interview Ouroboros contract", () => {
 	it("keeps ambiguity terminology while splitting readiness and artifact checks more explicitly", () => {
 		assert.match(
 			deepInterviewSkill,
-			/Interpret the weighted ambiguity score as an epistemic clarity heuristic/i,
+			/Treat the weighted ambiguity score as epistemic only/i,
 		);
 		assert.match(
 			deepInterviewSkill,
@@ -147,7 +147,7 @@ describe("deep-interview Ouroboros contract", () => {
 		);
 		assert.match(
 			deepInterviewSkill,
-			/Key term normalizations \(only when terms were overloaded, shifted, or mixed across categories\)/i,
+			/Define key terms when they are used inconsistently; state the normalization/i,
 		);
 		assert.match(
 			deepInterviewSkill,
@@ -155,11 +155,11 @@ describe("deep-interview Ouroboros contract", () => {
 		);
 		assert.match(
 			deepInterviewSkill,
-			/Failure labels \+ minimal repairs/i,
+			/label it \(`categorical` or `empirical`\), give a concrete counterexample, and state the minimal repair/i,
 		);
 		assert.match(
 			deepInterviewSkill,
-			/Modal summary: Known \/ unknown, Allowed without confirmation \/ requires confirmation, Feasible now \/ blocked, Must-have \/ nice-to-have/i,
+			/Modality summary/i,
 		);
 	});
 
