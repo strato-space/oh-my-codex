@@ -72,6 +72,11 @@
       "status": "active"
     },
     {
+      "name": "ontology-check",
+      "category": "planning",
+      "status": "active"
+    },
+    {
       "name": "analyze",
       "category": "shortcut",
       "status": "active"

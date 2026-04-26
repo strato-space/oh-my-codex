@@ -1,10 +1,10 @@
 {
-  "generatedAt": "2026-04-24T07:34:27.399Z",
+  "generatedAt": "2026-04-26T03:16:35.752Z",
   "version": "2026.02.28.1",
   "counts": {
-    "skillCount": 42,
+    "skillCount": 43,
     "promptCount": 30,
-    "activeSkillCount": 27,
+    "activeSkillCount": 28,
     "activeAgentCount": 18
   },
   "coreSkills": [
@@ -97,6 +97,13 @@
     },
     {
       "name": "deep-interview",
+      "category": "planning",
+      "status": "active",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "ontology-check",
       "category": "planning",
       "status": "active",
       "core": false,

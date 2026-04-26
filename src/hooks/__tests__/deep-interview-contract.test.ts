@@ -36,6 +36,10 @@ const autopilotSkill = readFileSync(
 	join(__dirname, "../../../skills/autopilot/SKILL.md"),
 	"utf-8",
 );
+const ontologyCheckSkill = readFileSync(
+	join(__dirname, "../../../skills/ontology-check/SKILL.md"),
+	"utf-8",
+);
 const templateAgents = readFileSync(
 	join(__dirname, "../../../templates/AGENTS.md"),
 	"utf-8",
@@ -135,9 +139,11 @@ describe("deep-interview Ouroboros contract", () => {
 	it("includes contract-style execution bridge and no-direct-implementation guard", () => {
 		assert.match(deepInterviewSkill, /Execution Bridge/i);
 		assert.match(deepInterviewSkill, /\$ralplan/i);
+		assert.match(deepInterviewSkill, /\$plan --consensus --direct <spec-path>/i);
 		assert.match(deepInterviewSkill, /\$autopilot/i);
 		assert.match(deepInterviewSkill, /\$ralph/i);
 		assert.match(deepInterviewSkill, /\$team/i);
+		assert.match(deepInterviewSkill, /\$ontology-check <spec-path>/i);
 		assert.match(deepInterviewSkill, /Input Artifact/i);
 		assert.match(deepInterviewSkill, /Invocation/i);
 		assert.match(deepInterviewSkill, /Consumer Behavior/i);
@@ -147,6 +153,14 @@ describe("deep-interview Ouroboros contract", () => {
 		assert.match(deepInterviewSkill, /Next Recommended Step/i);
 		assert.match(deepInterviewSkill, /Residual-Risk Rule/i);
 		assert.match(deepInterviewSkill, /Do NOT implement directly/i);
+		assert.match(
+			deepInterviewSkill,
+			/Optional ontology check/i,
+		);
+		assert.match(
+			deepInterviewSkill,
+			/advisory and does not replace or block the normal downstream choices/i,
+		);
 	});
 
 	it("documents omx question as the required structured questioning path with no fallback", () => {
@@ -327,6 +341,14 @@ describe("cross-skill and AGENTS coherence for deep-interview", () => {
 	it("autopilot references deep-interview handoff", () => {
 		assert.match(autopilotSkill, /deep-interview/i);
 		assert.match(autopilotSkill, /Socratic/i);
+	});
+
+	it("ontology-check is optional and does not launch downstream skills", () => {
+		assert.match(ontologyCheckSkill, /optional post-interview quality pass/i);
+		assert.match(ontologyCheckSkill, /Define key terms \(scholastic style\)/i);
+		assert.match(ontologyCheckSkill, /Validate ontology first/i);
+		assert.match(ontologyCheckSkill, /APPROVE.*ITERATE.*REJECT/s);
+		assert.match(ontologyCheckSkill, /do not launch `\$ralplan`, `\$autopilot`, `\$ralph`, or `\$team`/i);
 	});
 
 	it("tracked AGENTS surfaces include ouroboros keyword and updated description", () => {
