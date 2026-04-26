@@ -344,6 +344,8 @@ When the clarified task is specifically about `$autoresearch`, or the skill is i
 
 Present execution options after artifact generation using explicit handoff contracts. Treat the deep-interview spec as the current requirements source of truth and preserve intent, non-goals, decision boundaries, acceptance criteria, and any residual-risk warnings across the handoff.
 
+**Optional ontology check:** Recommend `$ontology-check <spec-path>` as an optional Greek-scholastic quality pass on the interview result before handoff. This check is advisory and does not replace or block the normal downstream choices below.
+
 ### 1. **`$ralplan` (Recommended)**
 - **Input Artifact:** `.omx/specs/deep-interview-{slug}.md` (optionally accompanied by the transcript/context snapshot for traceability)
 - **Invocation:** `$plan --consensus --direct <spec-path>`

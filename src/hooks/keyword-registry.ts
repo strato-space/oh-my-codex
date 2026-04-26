@@ -37,6 +37,7 @@ export const KEYWORD_TRIGGER_DEFINITIONS: readonly KeywordTriggerDefinition[] = 
 
   { keyword: '$ralplan', skill: 'ralplan', priority: 11, guidance: 'Activate consensus planning (planner + architect + critic)' },
   { keyword: 'consensus plan', skill: 'ralplan', priority: 11, guidance: 'Activate consensus planning (planner + architect + critic)' },
+  { keyword: '$ontology-check', skill: 'ontology-check', priority: 11, guidance: 'Activate optional ontology-first review of a spec or argument' },
 
   { keyword: '$autoresearch', skill: 'autoresearch', priority: 10, guidance: 'Activate autoresearch validator-gated research loop' },
 

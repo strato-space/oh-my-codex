@@ -90,6 +90,13 @@
       "internalRequired": false
     },
     {
+      "name": "ontology-check",
+      "category": "planning",
+      "status": "active",
+      "core": false,
+      "internalRequired": false
+    },
+    {
       "name": "analyze",
       "category": "shortcut",
       "status": "active",
