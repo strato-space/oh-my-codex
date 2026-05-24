@@ -97,6 +97,37 @@ function filterSessionOnlyEntries(
   ));
 }
 
+function modeStatePathForEntry(baseStateDir: string, entry: SkillActiveEntry): string {
+  const entrySessionId = safeString(entry.session_id).trim();
+  return entrySessionId
+    ? join(baseStateDir, 'sessions', entrySessionId, `${entry.skill}-state.json`)
+    : join(baseStateDir, `${entry.skill}-state.json`);
+}
+
+async function readActiveTrackedModesForEntries(
+  baseStateDir: string,
+  entries: readonly SkillActiveEntry[],
+): Promise<string[]> {
+  const activeModes = new Set<string>();
+
+  for (const entry of entries) {
+    if (!isTrackedWorkflowMode(entry.skill)) continue;
+    const path = modeStatePathForEntry(baseStateDir, entry);
+    if (!existsSync(path)) continue;
+    try {
+      const parsed = JSON.parse(await readFile(path, 'utf-8')) as { active?: unknown };
+      if (parsed.active === true) activeModes.add(entry.skill);
+    } catch {
+      // Preserve fail-closed transition behavior when canonical state points at
+      // an unreadable mode state: keep the canonical entry visible so the
+      // normal workflow overlap guard denies until the operator repairs it.
+      activeModes.add(entry.skill);
+    }
+  }
+
+  return [...activeModes];
+}
+
 function normalizeSkillActiveEntry(raw: unknown): SkillActiveEntry | null {
   if (!raw || typeof raw !== 'object') return null;
   const skill = safeString((raw as Record<string, unknown>).skill).trim();
@@ -362,9 +393,7 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
     : rootEntries.filter((entry) => safeString(entry.session_id).trim().length === 0);
 
   if (active && isTrackedWorkflowMode(mode)) {
-    const currentWorkflowModes = visibleEntries
-      .map((entry) => entry.skill)
-      .filter(isTrackedWorkflowMode);
+    const currentWorkflowModes = await readActiveTrackedModesForEntries(baseStateDir, visibleEntries);
     assertWorkflowTransitionAllowed(currentWorkflowModes, mode, 'write');
   }
 
@@ -378,7 +407,7 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
     const currentPrimary = safeString(inheritedBase.skill).trim();
     const primarySkill = pickPrimaryWorkflowMode(currentPrimary, entries.map((entry) => entry.skill), fallbackMode);
     const primaryEntry = entries.find((entry) => entry.skill === primarySkill) ?? entries[0];
-    return {
+    const nextState: SkillActiveStateLike = {
       ...inheritedBase,
       version: 1,
       active: entries.length > 0,
@@ -393,6 +422,12 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
       turn_id: primaryEntry?.turn_id || safeString(inheritedBase.turn_id).trim() || undefined,
       active_skills: entries,
     };
+
+    if (!entries.some((entry) => entry.skill === 'deep-interview' && entry.active !== false)) {
+      delete nextState.input_lock;
+    }
+
+    return nextState;
   };
 
   if (normalizedSessionId) {

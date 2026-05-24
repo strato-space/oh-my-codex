@@ -11,12 +11,7 @@ import {
   type WorkflowTransitionAction,
   type WorkflowTransitionDecision,
 } from './workflow-transition.js';
-import {
-  listActiveSkills,
-  readVisibleSkillActiveState,
-  readVisibleSkillActiveStateForStateDir,
-  syncCanonicalSkillStateForMode,
-} from './skill-active.js';
+import { syncCanonicalSkillStateForMode } from './skill-active.js';
 import { applyRunOutcomeContract } from '../runtime/run-outcome.js';
 import { clearDeepInterviewQuestionObligation } from '../question/deep-interview.js';
 
@@ -36,6 +31,32 @@ export interface ReconciledWorkflowTransition {
 
 function safeString(value: unknown): string {
   return typeof value === 'string' ? value : '';
+}
+
+interface ActiveTrackedModeRef {
+  mode: TrackedWorkflowMode;
+  path: string;
+}
+
+async function readActiveTrackedModeRefs(
+  cwd: string,
+  sessionId?: string,
+  baseStateDir?: string,
+): Promise<ActiveTrackedModeRef[]> {
+  const activeRefs: ActiveTrackedModeRef[] = [];
+
+  for (const mode of TRACKED_WORKFLOW_MODES) {
+    const candidatePath = modeStatePathForRoot(mode, cwd, sessionId, baseStateDir);
+    const state = await readJsonIfExists(candidatePath, {
+      mode,
+      throwOnParseError: true,
+    });
+    if (state?.active === true) {
+      activeRefs.push({ mode, path: candidatePath });
+    }
+  }
+
+  return activeRefs;
 }
 
 async function readJsonIfExists(
@@ -69,34 +90,17 @@ function modeStatePathForRoot(
   return getStatePath(mode, cwd, sessionId);
 }
 
-async function visibleTrackedModes(
+async function visibleTrackedModeRefs(
   cwd: string,
   sessionId?: string,
   baseStateDir?: string,
-): Promise<TrackedWorkflowMode[]> {
-  const canonical = baseStateDir
-    ? await readVisibleSkillActiveStateForStateDir(baseStateDir, sessionId)
-    : await readVisibleSkillActiveState(cwd, sessionId);
-  const canonicalModes = listActiveSkills(canonical ?? {})
-    .filter((entry) => sessionId || safeString(entry.session_id).trim().length === 0)
-    .map((entry) => entry.skill)
-    .filter(isTrackedWorkflowMode);
-
-  const visibleModes = new Set<TrackedWorkflowMode>(canonicalModes);
-  for (const mode of TRACKED_WORKFLOW_MODES) {
-    const candidatePaths = [modeStatePathForRoot(mode, cwd, sessionId, baseStateDir)];
-    for (const candidatePath of candidatePaths) {
-      const state = await readJsonIfExists(candidatePath, {
-        mode,
-        throwOnParseError: true,
-      });
-      if (state?.active === true) {
-        visibleModes.add(mode);
-      }
-    }
-  }
-
-  return [...visibleModes];
+): Promise<ActiveTrackedModeRef[]> {
+  // skill-active-state.json is a canonical mirror, not the authoritative
+  // lifecycle owner.  A stale mirror entry without a matching active mode state
+  // must not deny later workflows or make `omx state list-active` disagree with
+  // actual mode state.  Legitimate live workflows are still represented by the
+  // mode state ref below, which gives denial output an actionable path.
+  return readActiveTrackedModeRefs(cwd, sessionId, baseStateDir);
 }
 
 async function completeSourceModeState(
@@ -181,11 +185,17 @@ export async function reconcileWorkflowTransition(
   } = options;
   const currentModes = options.currentModes
     ? [...options.currentModes].filter(isTrackedWorkflowMode)
-    : await visibleTrackedModes(cwd, sessionId, baseStateDir);
+    : (await visibleTrackedModeRefs(cwd, sessionId, baseStateDir)).map((ref) => ref.mode);
+  const activeRefs = options.currentModes
+    ? []
+    : await visibleTrackedModeRefs(cwd, sessionId, baseStateDir);
   const decision = evaluateWorkflowTransition(currentModes, requestedMode);
 
   if (!decision.allowed) {
-    throw new Error(buildWorkflowTransitionError(currentModes, requestedMode, action));
+    const activePathHint = activeRefs.length > 0
+      ? ` Active workflow state path(s): ${activeRefs.map((ref) => `${ref.mode}=${ref.path}`).join(', ')}.`
+      : '';
+    throw new Error(`${buildWorkflowTransitionError(currentModes, requestedMode, action)}${activePathHint}`);
   }
 
   const completedPaths: string[] = [];

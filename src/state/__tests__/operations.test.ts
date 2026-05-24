@@ -590,6 +590,98 @@ describe('state operations directory initialization', () => {
     }
   });
 
+
+  it('ignores stale skill-active-only blockers when starting a new workflow', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-stale-skill-active-'));
+    try {
+      const sessionId = 'sess-stale-skill-active';
+      const sessionDir = join(wd, '.omx', 'state', 'sessions', sessionId);
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(join(wd, '.omx', 'state', 'session.json'), JSON.stringify({ session_id: sessionId }, null, 2));
+      await writeFile(
+        join(sessionDir, 'skill-active-state.json'),
+        JSON.stringify({
+          version: 1,
+          active: true,
+          skill: 'ultraqa',
+          phase: 'planning',
+          session_id: sessionId,
+          active_skills: [{ skill: 'ultraqa', phase: 'planning', active: true, session_id: sessionId }],
+        }, null, 2),
+      );
+
+      const activeBefore = await executeStateOperation('state_list_active', {
+        workingDirectory: wd,
+        session_id: sessionId,
+      });
+      assert.deepEqual(activeBefore.payload, { active_modes: [] });
+
+      const started = await executeStateOperation('state_write', {
+        workingDirectory: wd,
+        session_id: sessionId,
+        mode: 'ralph',
+        active: true,
+        iteration: 1,
+        max_iterations: 5,
+        current_phase: 'executing',
+      });
+
+      assert.equal(started.isError, undefined);
+      assert.equal((started.payload as { success?: boolean }).success, true);
+
+      const activeAfter = await executeStateOperation('state_list_active', {
+        workingDirectory: wd,
+        session_id: sessionId,
+      });
+      assert.deepEqual(activeAfter.payload, { active_modes: ['ralph'] });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps legitimate active workflow denials actionable with a state path', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-active-path-denial-'));
+    try {
+      const sessionId = 'sess-active-path-denial';
+      const sessionDir = join(wd, '.omx', 'state', 'sessions', sessionId);
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(join(wd, '.omx', 'state', 'session.json'), JSON.stringify({ session_id: sessionId }, null, 2));
+      await writeFile(
+        join(sessionDir, 'ultraqa-state.json'),
+        JSON.stringify({ active: true, mode: 'ultraqa', current_phase: 'planning' }, null, 2),
+      );
+      await writeFile(
+        join(sessionDir, 'skill-active-state.json'),
+        JSON.stringify({
+          version: 1,
+          active: true,
+          skill: 'ultraqa',
+          phase: 'planning',
+          session_id: sessionId,
+          active_skills: [{ skill: 'ultraqa', phase: 'planning', active: true, session_id: sessionId }],
+        }, null, 2),
+      );
+
+      const denied = await executeStateOperation('state_write', {
+        workingDirectory: wd,
+        session_id: sessionId,
+        mode: 'autopilot',
+        active: true,
+        current_phase: 'planning',
+      });
+
+      assert.equal(denied.isError, true);
+      const message = String((denied.payload as { error?: string }).error || '');
+      assert.match(message, /Cannot write autopilot: ultraqa is already active/);
+      assert.match(message, /omx state clear --input '\{"mode":"<mode>"\}' --json/);
+      assert.match(message, /Active workflow state path\(s\): ultraqa=/);
+      assert.match(message, /ultraqa-state\.json/);
+      assert.equal(existsSync(join(sessionDir, 'autopilot-state.json')), false);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it('keeps session-scoped tracked state writable after root-state parse fallback on resume', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-resume-root-fallback-'));
     try {

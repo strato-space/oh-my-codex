@@ -178,6 +178,36 @@ describe('skill-active state helpers', () => {
     });
   });
 
+
+  it('releases stale deep-interview input_lock when canonical state is completed', async () => {
+    await withTempRepo('omx-skill-active-release-input-lock-', async (cwd) => {
+      await mkdir(join(cwd, '.omx', 'state'), { recursive: true });
+      await writeSkillActiveStateCopies(cwd, {
+        active: true,
+        skill: 'deep-interview',
+        phase: 'interviewing',
+        session_id: 'sess-lock',
+        input_lock: { active: true, scope: 'deep-interview-auto-approval' },
+        active_skills: [{ skill: 'deep-interview', phase: 'interviewing', active: true, session_id: 'sess-lock' }],
+      }, 'sess-lock');
+
+      await syncCanonicalSkillStateForMode({
+        cwd,
+        mode: 'deep-interview',
+        active: false,
+        currentPhase: 'completed',
+        sessionId: 'sess-lock',
+        nowIso: '2026-05-24T00:00:00.000Z',
+      });
+
+      const sessionState = await readVisibleSkillActiveState(cwd, 'sess-lock') as Record<string, unknown> | null;
+      assert.ok(sessionState);
+      assert.equal(sessionState.active, false);
+      assert.equal(sessionState.input_lock, undefined);
+      assert.deepEqual(listActiveSkills(sessionState), []);
+    });
+  });
+
   it('clears only the matching terminal session entry and preserves unrelated active skills', async () => {
     await withTempRepo('omx-skill-active-terminal-clear-', async (cwd) => {
       await mkdir(join(cwd, '.omx', 'state'), { recursive: true });
