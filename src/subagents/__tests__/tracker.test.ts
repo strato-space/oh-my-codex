@@ -51,6 +51,98 @@ describe('subagents/tracker', () => {
     assert.deepEqual(drained?.activeSubagentThreadIds, []);
   });
 
+  it('can record an explicitly spawned subagent as subagent even when it is the first seen thread', () => {
+    let state = createSubagentTrackingState();
+    state = recordSubagentTurn(state, {
+      sessionId: 'sess-ralplan',
+      threadId: 'thread-architect',
+      timestamp: '2026-05-28T17:59:43.270Z',
+      mode: 'architect',
+      kind: 'subagent',
+    });
+    state = recordSubagentTurn(state, {
+      sessionId: 'sess-ralplan',
+      threadId: 'thread-critic',
+      timestamp: '2026-05-28T18:01:49.547Z',
+      mode: 'critic',
+      kind: 'subagent',
+    });
+
+    const summary = summarizeSubagentSession(state, 'sess-ralplan', {
+      now: '2026-05-28T18:02:00.000Z',
+      activeWindowMs: 120_000,
+    });
+
+    assert.equal(state.sessions['sess-ralplan']?.leader_thread_id, undefined);
+    assert.equal(state.sessions['sess-ralplan']?.threads['thread-architect']?.kind, 'subagent');
+    assert.equal(state.sessions['sess-ralplan']?.threads['thread-critic']?.kind, 'subagent');
+    assert.deepEqual(summary?.allSubagentThreadIds, ['thread-architect', 'thread-critic']);
+  });
+
+  it('keeps an explicitly spawned first-seen subagent as subagent after a generic follow-up turn', () => {
+    let state = createSubagentTrackingState();
+    state = recordSubagentTurn(state, {
+      sessionId: 'sess-ralplan',
+      threadId: 'thread-architect',
+      timestamp: '2026-05-28T17:59:43.270Z',
+      mode: 'architect',
+      kind: 'subagent',
+    });
+    state = recordSubagentTurn(state, {
+      sessionId: 'sess-ralplan',
+      threadId: 'thread-architect',
+      turnId: 'turn-after-session-start',
+      timestamp: '2026-05-28T18:00:05.000Z',
+      mode: 'architect',
+    });
+
+    assert.equal(state.sessions['sess-ralplan']?.leader_thread_id, undefined);
+    assert.equal(state.sessions['sess-ralplan']?.threads['thread-architect']?.kind, 'subagent');
+    assert.equal(state.sessions['sess-ralplan']?.threads['thread-architect']?.turn_count, 2);
+    assert.equal(state.sessions['sess-ralplan']?.threads['thread-architect']?.last_turn_id, 'turn-after-session-start');
+  });
+
+  it('does not promote existing subagent evidence when the same thread later acts as a parent', () => {
+    let state = createSubagentTrackingState();
+    state = recordSubagentTurn(state, {
+      sessionId: 'sess-ralplan',
+      threadId: 'thread-architect',
+      timestamp: '2026-05-28T17:59:43.270Z',
+      mode: 'architect',
+      kind: 'subagent',
+    });
+    state = recordSubagentTurn(state, {
+      sessionId: 'sess-ralplan',
+      threadId: 'thread-architect',
+      timestamp: '2026-05-28T18:00:10.000Z',
+      mode: 'architect',
+      kind: 'leader',
+    });
+
+    assert.equal(state.sessions['sess-ralplan']?.leader_thread_id, undefined);
+    assert.equal(state.sessions['sess-ralplan']?.threads['thread-architect']?.kind, 'subagent');
+  });
+
+  it('lets explicit native subagent evidence repair a prior first-seen leader inference', () => {
+    let state = createSubagentTrackingState();
+    state = recordSubagentTurn(state, {
+      sessionId: 'sess-ralplan',
+      threadId: 'thread-architect',
+      timestamp: '2026-05-28T17:59:40.000Z',
+      mode: 'architect',
+    });
+    state = recordSubagentTurn(state, {
+      sessionId: 'sess-ralplan',
+      threadId: 'thread-architect',
+      timestamp: '2026-05-28T17:59:43.270Z',
+      mode: 'architect',
+      kind: 'subagent',
+    });
+
+    assert.equal(state.sessions['sess-ralplan']?.leader_thread_id, undefined);
+    assert.equal(state.sessions['sess-ralplan']?.threads['thread-architect']?.kind, 'subagent');
+  });
+
   it('reconciles completed subagent threads before reporting active wait state', () => {
     let state = createSubagentTrackingState();
     state = recordSubagentTurn(state, {
