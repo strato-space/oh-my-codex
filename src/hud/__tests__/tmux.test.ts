@@ -146,6 +146,13 @@ describe('HUD pane ownership helpers', () => {
     });
   });
 
+  it('preserves tab-containing start commands when reading the optional cwd column', () => {
+    const [pane] = parseTmuxPaneSnapshot('%9\tnode\tnode\t/omx.js hud --watch\t/tmp/repo');
+
+    assert.equal(pane?.startCommand, 'node\t/omx.js hud --watch');
+    assert.equal(pane?.currentPath, '/tmp/repo');
+  });
+
   it('keeps independent leaders in one tmux window from matching each other HUD panes', () => {
     const panes = parseTmuxPaneSnapshot(
       [
@@ -233,7 +240,7 @@ describe('HUD pane ownership helpers', () => {
 
     assert.deepEqual(listCurrentWindowHudPaneIds(undefined, execTmuxSync, { sessionId: 'sess-a' }), ['%2']);
     assert.deepEqual(calls, [
-      ['list-panes', '-F', '#{pane_id}\t#{pane_current_command}\t#{pane_start_command}'],
+      ['list-panes', '-F', '#{pane_id}\t#{pane_current_command}\t#{pane_start_command}\t#{pane_current_path}'],
     ]);
   });
 
@@ -330,6 +337,46 @@ describe('dead HUD pane reaper', () => {
     });
 
     assert.deepEqual(result, { reaped: [], preserved: ['%2'] });
+  });
+
+  it('kills untagged HUD panes whose tmux cwd has been deleted', () => {
+    const panes = parseTmuxPaneSnapshot(
+      [
+        '%1\tcodex\tcodex\t/repo',
+        '%2\tnode\tnode /tmp/bin/omx.js hud --watch\t/tmp/omx-doctor-native-hook-dist-QLbHN0 (deleted)',
+      ].join('\n'),
+    );
+    const killed: string[] = [];
+
+    const result = reapDeadHudPanes(panes, {
+      killPane: (paneId) => {
+        killed.push(paneId);
+        return true;
+      },
+    });
+
+    assert.deepEqual(killed, ['%2']);
+    assert.deepEqual(result, { reaped: ['%2'], preserved: [] });
+  });
+
+  it('kills deleted-cwd HUD panes even when an old owner tag points at a live leader', () => {
+    const panes = parseTmuxPaneSnapshot(
+      [
+        '%1\tcodex\tcodex\t/repo',
+        `%2\tnode\texec env OMX_SESSION_ID='doctor-smoke' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' /node /omx.js hud --watch\t/tmp/omx-doctor-plugin-hook-8r1QUC (deleted)`,
+      ].join('\n'),
+    );
+    const killed: string[] = [];
+
+    const result = reapDeadHudPanes(panes, {
+      killPane: (paneId) => {
+        killed.push(paneId);
+        return true;
+      },
+    });
+
+    assert.deepEqual(killed, ['%2']);
+    assert.deepEqual(result, { reaped: ['%2'], preserved: [] });
   });
 
   it('does not touch non-HUD panes', () => {
