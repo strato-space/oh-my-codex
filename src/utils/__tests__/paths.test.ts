@@ -14,7 +14,11 @@ import {
   listInstalledSkillDirectories,
   detectLegacySkillRootOverlap,
   omxStateDir,
+  omxRoot,
   omxProjectMemoryPath,
+  canonicalProjectMemoryPath,
+  projectMemoryPathCandidates,
+  resolveProjectMemoryPath,
   omxNotepadPath,
   omxPlansDir,
   omxAdaptersDir,
@@ -346,12 +350,43 @@ describe("listInstalledSkillDirectories", () => {
 });
 
 describe("omxStateDir", () => {
+  let originalOmxRoot: string | undefined;
+  let originalOmxStateRoot: string | undefined;
+
+  beforeEach(() => {
+    originalOmxRoot = process.env.OMX_ROOT;
+    originalOmxStateRoot = process.env.OMX_STATE_ROOT;
+  });
+
+  afterEach(() => {
+    if (typeof originalOmxRoot === "string") process.env.OMX_ROOT = originalOmxRoot;
+    else delete process.env.OMX_ROOT;
+    if (typeof originalOmxStateRoot === "string") process.env.OMX_STATE_ROOT = originalOmxStateRoot;
+    else delete process.env.OMX_STATE_ROOT;
+  });
+
   it("uses provided projectRoot", () => {
     assert.equal(omxStateDir("/my/project"), join("/my/project", ".omx", "state"));
   });
 
   it("defaults to cwd when no projectRoot given", () => {
     assert.equal(omxStateDir(), join(process.cwd(), ".omx", "state"));
+  });
+
+  it("uses OMX_ROOT override when set", () => {
+    process.env.OMX_ROOT = "/tmp/omx-root";
+    assert.equal(omxRoot("/ignored/project"), "/tmp/omx-root/.omx");
+    assert.equal(omxStateDir("/ignored/project"), "/tmp/omx-root/.omx/state");
+  });
+
+  it("uses OMX_ROOT as boxed workspace root for all runtime paths", () => {
+    process.env.OMX_ROOT = "/tmp/omx-box";
+    assert.equal(omxRoot("/ignored/project"), "/tmp/omx-box/.omx");
+    assert.equal(omxStateDir("/ignored/project"), "/tmp/omx-box/.omx/state");
+    assert.equal(omxProjectMemoryPath("/ignored/project"), "/tmp/omx-box/.omx/project-memory.json");
+    assert.equal(omxNotepadPath("/ignored/project"), "/tmp/omx-box/.omx/notepad.md");
+    assert.equal(omxPlansDir("/ignored/project"), "/tmp/omx-box/.omx/plans");
+    assert.equal(omxLogsDir("/ignored/project"), "/tmp/omx-box/.omx/logs");
   });
 });
 
@@ -368,6 +403,38 @@ describe("omxProjectMemoryPath", () => {
       omxProjectMemoryPath(),
       join(process.cwd(), ".omx", "project-memory.json"),
     );
+  });
+});
+
+describe("project memory startup path resolution", () => {
+  it("prefers repository project-memory.json over legacy .omx/project-memory.json", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-project-memory-paths-"));
+    try {
+      await mkdir(join(wd, ".omx"), { recursive: true });
+      await writeFile(join(wd, "project-memory.json"), "{}");
+      await writeFile(join(wd, ".omx", "project-memory.json"), "{}");
+
+      assert.equal(canonicalProjectMemoryPath(wd), join(wd, "project-memory.json"));
+      assert.deepEqual(projectMemoryPathCandidates(wd), [
+        join(wd, "project-memory.json"),
+        join(wd, ".omx", "project-memory.json"),
+      ]);
+      assert.equal(resolveProjectMemoryPath(wd), join(wd, "project-memory.json"));
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to legacy .omx/project-memory.json when canonical memory is absent", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-project-memory-legacy-path-"));
+    try {
+      await mkdir(join(wd, ".omx"), { recursive: true });
+      await writeFile(join(wd, ".omx", "project-memory.json"), "{}");
+
+      assert.equal(resolveProjectMemoryPath(wd), join(wd, ".omx", "project-memory.json"));
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
   });
 });
 

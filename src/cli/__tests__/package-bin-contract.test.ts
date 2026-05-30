@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { getInstallableNativeAgentNames } from '../../agents/policy.js';
 import { getSetupInstallableSkillNames } from '../../catalog/installable.js';
 import { readCatalogManifest } from '../../catalog/reader.js';
+import { OMX_FIRST_PARTY_MCP_PLUGIN_TARGETS } from '../../config/omx-first-party-mcp.js';
 
 type PackageJson = {
   files?: string[];
@@ -39,7 +40,8 @@ describe('package bin contract', () => {
     assert.deepEqual(pkg.bin, { omx: 'dist/cli/omx.js' });
     assert.equal(pkg.scripts?.['build:explore'], 'cargo build -p omx-explore-harness');
     assert.equal(pkg.scripts?.['build:explore:release'], 'node dist/scripts/build-explore-harness.js');
-    assert.equal(pkg.scripts?.['build:full'], 'npm run build && npm run build:explore:release && npm run build:sparkshell');
+    assert.equal(pkg.scripts?.['build:full'], 'npm run build && npm run build:explore:release && npm run build:sparkshell && npm run build:api');
+    assert.equal(pkg.scripts?.['build:api'], 'node dist/scripts/build-api.js');
     assert.equal(pkg.scripts?.['clean:native-package-assets'], 'node dist/scripts/cleanup-explore-harness.js');
     assert.equal(pkg.scripts?.['sync:plugin'], 'node dist/scripts/sync-plugin-mirror.js');
     assert.equal(pkg.scripts?.['sync:plugin:check'], 'node dist/scripts/sync-plugin-mirror.js --check');
@@ -55,7 +57,7 @@ describe('package bin contract', () => {
     assert.equal(pkg.scripts?.['test:ci:compiled'], 'npm run verify:native-agents && npm run verify:plugin-bundle && npm run test:node && node dist/scripts/generate-catalog-docs.js --check');
     assert.equal(
       pkg.scripts?.['coverage:team-critical'],
-      "npm run build && c8 --all --src dist/team --src dist/state --include 'dist/team/**/*.js' --include 'dist/state/**/*.js' --exclude '**/__tests__/**' --reporter=text-summary --reporter=lcov --reporter=json-summary --report-dir coverage/team --check-coverage --lines=78 --functions=90 --branches=70 --statements=78 node dist/scripts/run-test-files.js dist/team/__tests__ dist/state/__tests__",
+      'npm run build && npm run coverage:team-critical:compiled',
     );
     assert.equal(
       pkg.scripts?.['coverage:team-critical:compiled'],
@@ -63,7 +65,7 @@ describe('package bin contract', () => {
     );
     assert.equal(
       pkg.scripts?.['coverage:ts:full'],
-      "npm run build && c8 --all --src dist --exclude '**/__tests__/**' --exclude 'dist/bin/**' --exclude 'dist/**/*.d.ts' --reporter=text-summary --reporter=lcov --reporter=json-summary --report-dir coverage/ts-full node dist/scripts/run-test-files.js dist",
+      'npm run build && npm run coverage:ts:full:compiled',
     );
     assert.equal(
       pkg.scripts?.['coverage:ts:full:compiled'],
@@ -101,6 +103,46 @@ describe('package bin contract', () => {
     const binSource = readFileSync(binPath, 'utf-8');
     const compiledCliSource = readFileSync(compiledCliPath, 'utf-8');
     assert.match(binSource, /^#!\/usr\/bin\/env node/);
+    const mcpInitialize = JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2024-11-05',
+        capabilities: {},
+        clientInfo: { name: 'package-bin-contract', version: '0' },
+      },
+    }) + '\n';
+    for (const target of OMX_FIRST_PARTY_MCP_PLUGIN_TARGETS) {
+      const mcpServe = spawnSync(
+        process.execPath,
+        [binPath, 'mcp-serve', target],
+        {
+          cwd: process.cwd(),
+          encoding: 'utf-8',
+          input: mcpInitialize,
+          timeout: 5_000,
+        },
+      );
+      assert.equal(
+        mcpServe.status,
+        0,
+        `${target} stderr=${mcpServe.stderr} stdout=${mcpServe.stdout}`,
+      );
+      assert.notEqual(
+        mcpServe.stdout.trim(),
+        '',
+        `omx bin wrapper must keep mcp-serve ${target} alive long enough to complete stdio initialization`,
+      );
+      const mcpResponse = JSON.parse(mcpServe.stdout) as {
+        result?: { serverInfo?: { name?: string; version?: string } };
+      };
+      assert.match(
+        mcpResponse.result?.serverInfo?.name ?? '',
+        /^omx-/,
+        `${target} initialize response should include serverInfo`,
+      );
+    }
     assert.match(compiledCliSource, /omx update\s+Check npm now, update the global install immediately, then refresh setup/);
     assert.match(compiledCliSource, /case "update"/);
 
@@ -124,7 +166,7 @@ describe('package bin contract', () => {
     const packagedHarnessPath = process.platform === 'win32' ? 'bin/omx-explore-harness.exe' : 'bin/omx-explore-harness';
     const packagedHarnessEntry = results[0]?.files?.find((file) => file.path === packagedHarnessPath);
     const packagedHarnessMetaEntry = results[0]?.files?.find((file) => file.path === 'bin/omx-explore-harness.meta.json');
-    const sparkshellEntry = results[0]?.files?.find((file) => file.path.includes('bin/native/'));
+    const nativeBinaryEntry = results[0]?.files?.find((file) => file.path.includes('bin/native/'));
     const cargoTomlEntry = results[0]?.files?.find((file) => file.path === 'Cargo.toml');
     const cargoLockEntry = results[0]?.files?.find((file) => file.path === 'Cargo.lock');
     const crateManifestEntry = results[0]?.files?.find((file) => file.path === 'crates/omx-explore/Cargo.toml');
@@ -151,7 +193,7 @@ describe('package bin contract', () => {
 
     assert.equal(packagedHarnessEntry, undefined, `did not expect ${packagedHarnessPath} in npm pack output`);
     assert.equal(packagedHarnessMetaEntry, undefined, 'did not expect packaged explore harness metadata in npm pack output');
-    assert.equal(sparkshellEntry, undefined, 'did not expect staged sparkshell binaries in npm pack output');
+    assert.equal(nativeBinaryEntry, undefined, 'did not expect staged native binaries in npm pack output');
     assert.ok(cargoTomlEntry, 'expected npm pack output to include Cargo.toml');
     assert.ok(cargoLockEntry, 'expected npm pack output to include Cargo.lock');
     assert.ok(crateManifestEntry, 'expected npm pack output to include crates/omx-explore/Cargo.toml');

@@ -142,7 +142,8 @@ const maxLifetimeMs = runOnce
     )
   );
 
-const omxDir = join(cwd, '.omx');
+const runtimeRoot = resolve(process.env.OMX_ROOT || process.env.OMX_STATE_ROOT || cwd);
+const omxDir = join(runtimeRoot, '.omx');
 const logsDir = join(omxDir, 'logs');
 const stateDir = join(omxDir, 'state');
 const statePath = join(stateDir, 'notify-fallback-state.json');
@@ -1648,8 +1649,12 @@ async function invokeNotifyHook(payload: Record<string, unknown>, filePath: stri
   const result = spawnSync(process.execPath, [notifyScript, JSON.stringify(payload)], {
     cwd,
     encoding: 'utf-8',
-      windowsHide: true,
-    });
+    env: {
+      ...process.env,
+      OMX_NOTIFY_HOOK_TRUSTED_MANAGED_CWD: cwd,
+    },
+    windowsHide: true,
+  });
   const ok = result.status === 0;
   await eventLog({
     type: 'fallback_notify',
@@ -1958,10 +1963,15 @@ function shutdown(signal: string): void {
 }
 
 async function main(): Promise<void> {
+  if (process.env.NODE_ENV === 'test' && process.env.OMX_NOTIFY_FALLBACK_TEST_FATAL === '1') {
+    throw new Error('test fatal notify fallback failure');
+  }
   await mkdir(logsDir, { recursive: true }).catch(() => {});
   await mkdir(stateDir, { recursive: true }).catch(() => {});
   if (!existsSync(notifyScript)) {
+    const reason = `notify script missing: ${notifyScript}`;
     await eventLog({ type: 'watcher_error', reason: 'notify_script_missing', notify_script: notifyScript });
+    process.stderr.write(`notify-fallback-watcher: ${reason}\n`);
     process.exit(1);
   }
 
@@ -2001,10 +2011,12 @@ async function main(): Promise<void> {
 
 main().catch(async (err) => {
   await mkdir(dirname(logPath), { recursive: true }).catch(() => {});
+  const message = err instanceof Error ? err.message : safeString(err);
   await eventLog({
     type: 'watcher_error',
     reason: 'fatal',
-    error: err instanceof Error ? err.message : safeString(err),
+    error: message,
   });
+  process.stderr.write(`notify-fallback-watcher: fatal: ${message || 'unknown error'}\n`);
   process.exit(1);
 });

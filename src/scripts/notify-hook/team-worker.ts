@@ -5,7 +5,8 @@
 
 import { readFile, writeFile, mkdir, appendFile, rename, stat, readdir } from 'fs/promises';
 import { existsSync } from 'fs';
-import { join, resolve as resolvePath } from 'path';
+import { join } from 'path';
+import { resolveWorkerNotifyTeamStateRootPath } from '../../team/state-root.js';
 import { asNumber, safeString, isTerminalPhase } from './utils.js';
 import { readJsonIfExists } from './state-io.js';
 import { logTmuxHookEvent } from './log.js';
@@ -19,55 +20,10 @@ import {
 import { DEFAULT_MARKER } from '../tmux-hook-engine.js';
 const LEADER_PANE_SHELL_NO_INJECTION_REASON = 'leader_pane_shell_no_injection';
 
-async function readTeamStateRootFromJson(path) {
-  try {
-    if (!existsSync(path)) return null;
-    const parsed = JSON.parse(await readFile(path, 'utf-8'));
-    const value = parsed && typeof parsed.team_state_root === 'string'
-      ? parsed.team_state_root.trim()
-      : '';
-    return value ? value : null;
-  } catch {
-    return null;
-  }
-}
-
 export async function resolveTeamStateDirForWorker(cwd, parsedTeamWorker) {
-  const explicitStateRoot = safeString(process.env.OMX_TEAM_STATE_ROOT || '').trim();
-  if (explicitStateRoot) {
-    return resolvePath(cwd, explicitStateRoot);
-  }
-
-  const teamName = parsedTeamWorker.teamName;
-  const workerName = parsedTeamWorker.workerName;
-  const leaderCwd = safeString(process.env.OMX_TEAM_LEADER_CWD || '').trim();
-
-  const candidateStateDirs = [];
-  if (leaderCwd) {
-    candidateStateDirs.push(join(resolvePath(leaderCwd), '.omx', 'state'));
-  }
-  candidateStateDirs.push(join(cwd, '.omx', 'state'));
-
-  for (const candidateStateDir of candidateStateDirs) {
-    const teamRoot = join(candidateStateDir, 'team', teamName);
-    if (!existsSync(teamRoot)) continue;
-
-    const identityRoot = await readTeamStateRootFromJson(
-      join(teamRoot, 'workers', workerName, 'identity.json'),
-    );
-    if (identityRoot) return resolvePath(cwd, identityRoot);
-
-    const manifestRoot = await readTeamStateRootFromJson(join(teamRoot, 'manifest.v2.json'));
-    if (manifestRoot) return resolvePath(cwd, manifestRoot);
-
-    const configRoot = await readTeamStateRootFromJson(join(teamRoot, 'config.json'));
-    if (configRoot) return resolvePath(cwd, configRoot);
-
-    return candidateStateDir;
-  }
-
-  return join(cwd, '.omx', 'state');
+  return resolveWorkerNotifyTeamStateRootPath(cwd, parsedTeamWorker, process.env);
 }
+
 
 export function parseTeamWorkerEnv(rawValue) {
   if (typeof rawValue !== 'string') return null;
@@ -243,25 +199,34 @@ export async function readWorkerStatusState(stateDir, teamName, workerName) {
 }
 
 export async function readTeamWorkersForIdleCheck(stateDir, teamName) {
-  // Try manifest.v2.json first (preferred), then config.json
+  // Try manifest.v2.json first (preferred), then config.json. Some older or
+  // synthetic team states have a partial manifest plus the usable worker pane
+  // metadata in config.json, so fall through when a candidate is incomplete.
   const manifestPath = join(stateDir, 'team', teamName, 'manifest.v2.json');
   const configPath = join(stateDir, 'team', teamName, 'config.json');
-  const srcPath = existsSync(manifestPath) ? manifestPath : existsSync(configPath) ? configPath : null;
-  if (!srcPath) return null;
+  const candidatePaths = [manifestPath, configPath].filter((path) => existsSync(path));
+  let fallback = null;
 
-  try {
-    const raw = await readFile(srcPath, 'utf-8');
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object') return null;
-    const workers = parsed.workers;
-    if (!Array.isArray(workers) || workers.length === 0) return null;
-    const tmuxSession = safeString(parsed.tmux_session || '').trim();
-    const leaderPaneId = safeString(parsed.leader_pane_id || '').trim();
-    return { workers, tmuxSession, leaderPaneId };
-  } catch {
-    return null;
+  for (const srcPath of candidatePaths) {
+    try {
+      const raw = await readFile(srcPath, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') continue;
+      const workers = parsed.workers;
+      if (!Array.isArray(workers) || workers.length === 0) continue;
+      const tmuxSession = safeString(parsed.tmux_session || '').trim();
+      const leaderPaneId = safeString(parsed.leader_pane_id || '').trim();
+      const result = { workers, tmuxSession, leaderPaneId };
+      if (leaderPaneId) return result;
+      if (!fallback) fallback = result;
+    } catch {
+      // Try the next state source.
+    }
   }
+
+  return fallback;
 }
+
 
 async function readTeamTaskCounts(stateDir, teamName) {
   const tasksDir = join(stateDir, 'team', teamName, 'tasks');

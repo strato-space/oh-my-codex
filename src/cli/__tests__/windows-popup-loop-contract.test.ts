@@ -18,7 +18,7 @@ describe('Windows popup loop contracts', () => {
     assert.match(cliIndex, /buildWindowsMsysBackgroundHelperBootstrapScript/);
     assert.match(
       cliIndex,
-      /const pidPath = notifyFallbackPidPath\(cwd\);\s+await reapStaleNotifyFallbackWatcher\(pidPath\);\s+if \(!shouldEnableNotifyFallbackWatcher\(process\.env,\s*process\.platform\)\) return;/,
+      /const pidPath = notifyFallbackPidPath\(cwd\);\s+const reapResult = await reapStaleNotifyFallbackWatcher\(pidPath\);\s+if \(reapResult === "recent_active"\) return;\s+if \(!shouldEnableNotifyFallbackWatcher\(process\.env,\s*process\.platform\)\) return;/,
     );
     assert.match(cliIndex, /detached:\s*shouldDetachBackgroundHelper\(options\.env,\s*process\.platform\),\s*[\s\S]*?stdio:\s*"ignore",\s*[\s\S]*?windowsHide:\s*true/);
     assert.match(cliIndex, /spawnSync\([\s\S]*?buildWindowsMsysBackgroundHelperBootstrapScript\([\s\S]*?windowsHide:\s*true/);

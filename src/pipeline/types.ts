@@ -1,8 +1,8 @@
 /**
  * Pipeline stage interfaces for oh-my-codex
  *
- * Shared stage contracts that align with OMC pipeline design (#1130).
- * The pipeline sequences: RALPLAN -> teams (codex workers) -> ralph verification.
+ * Shared stage contracts for the default Autopilot loop.
+ * The pipeline sequences: deep-interview -> ralplan -> ultragoal -> code-review -> ultraqa.
  */
 
 // ---------------------------------------------------------------------------
@@ -52,10 +52,10 @@ export interface StageResult {
 
 /**
  * A single stage in the pipeline. Implementations wrap concrete execution
- * backends (ralplan, team, ralph) behind this uniform interface.
+ * backends (deep-interview, ralplan, ultragoal, code-review, ultraqa, and legacy team/Ralph adapters) behind this uniform interface.
  */
 export interface PipelineStage {
-  /** Unique name for this stage (e.g. 'ralplan', 'team-exec', 'ralph-verify'). */
+  /** Unique name for this stage (e.g. 'deep-interview', 'ralplan', 'ultragoal', 'code-review'). */
   readonly name: string;
 
   /** Execute the stage. Must return a StageResult. */
@@ -93,13 +93,12 @@ export interface PipelineConfig {
 
   /**
    * Maximum ralph verification iterations.
-   * Passed through to the ralph-verify stage. Defaults to 10.
+   * Passed through to the ralph stage. Defaults to 10.
    */
   maxRalphIterations?: number;
 
   /**
-   * Number of team workers for the execution stage.
-   * Passed through to the team-exec stage. Defaults to 2.
+   * Legacy worker count for adapters that still launch team execution. Defaults to 2.
    */
   workerCount?: number;
 
@@ -157,7 +156,22 @@ export interface PipelineModeStateExtension {
   /** Per-stage results collected so far. */
   pipeline_stage_results: Record<string, StageResult>;
 
-  /** Ralph iteration ceiling for the verification stage. */
+  /** Current review cycle count; increments when code-review is not clean. */
+  review_cycle?: number;
+
+  /** Latest code-review verdict artifact. */
+  review_verdict?: unknown;
+
+  /** Latest UltraQA verdict artifact. */
+  qa_verdict?: unknown;
+
+  /** Reason Autopilot returned to ralplan after a non-clean review. */
+  return_to_ralplan_reason?: string | null;
+
+  /** Phase handoff artifacts keyed by contract names such as deep_interview, ralplan, ultragoal, code_review, and ultraqa. */
+  handoff_artifacts?: Record<string, unknown>;
+
+  /** Quality-gate retry ceiling; legacy name retained for API compatibility. */
   pipeline_max_ralph_iterations: number;
 
   /** Worker count for team execution. */

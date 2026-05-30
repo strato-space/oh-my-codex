@@ -1,4 +1,5 @@
-import { readHudConfig } from './state.js';
+import { readAllState, readHudConfig } from './state.js';
+import { getHudRenderMaxLines } from './render.js';
 import { HUD_TMUX_HEIGHT_LINES } from './constants.js';
 import {
   buildHudWatchCommand,
@@ -7,15 +8,25 @@ import {
   isHudWatchPane,
   killTmuxPane,
   listCurrentWindowPanes,
+  registerHudResizeHook,
+  unregisterHudResizeHook,
   resizeTmuxPane,
   type TmuxPaneSnapshot,
 } from './tmux.js';
 import { resolveOmxCliEntryPath } from '../utils/paths.js';
 
+export const OMX_TMUX_HUD_OWNER_ENV = 'OMX_TMUX_HUD_OWNER';
+
+function isExplicitOmxOwnedTmuxEnv(env: NodeJS.ProcessEnv): boolean {
+  return env[OMX_TMUX_HUD_OWNER_ENV] === '1';
+}
+
 export interface ReconcileHudForPromptSubmitResult {
   status:
     | 'skipped_not_tmux'
     | 'skipped_no_entry'
+    | 'skipped_not_omx_owned_tmux'
+    | 'skipped_no_session_id'
     | 'resized'
     | 'recreated'
     | 'replaced_duplicates'
@@ -37,7 +48,23 @@ export interface ReconcileHudForPromptSubmitDeps {
   killTmuxPane?: (paneId: string) => boolean;
   resizeTmuxPane?: (paneId: string, heightLines: number) => boolean;
   readHudConfig?: typeof readHudConfig;
+  readAllState?: typeof readAllState;
   resolveOmxCliEntryPath?: typeof resolveOmxCliEntryPath;
+  registerHudResizeHook?: (hudPaneId: string, currentPaneId: string | undefined, heightLines: number) => boolean;
+  unregisterHudResizeHook?: (currentPaneId: string | undefined) => boolean;
+}
+
+function ensureHudResizeHook(
+  hudPaneId: string,
+  currentPaneId: string | undefined,
+  desiredHeight: number,
+  deps: ReconcileHudForPromptSubmitDeps,
+): void {
+  try {
+    (deps.registerHudResizeHook ?? registerHudResizeHook)(hudPaneId, currentPaneId, desiredHeight);
+  } catch {
+    // Non-critical — hook registration failure does not break HUD lifecycle.
+  }
 }
 
 export async function reconcileHudForPromptSubmit(
@@ -48,6 +75,15 @@ export async function reconcileHudForPromptSubmit(
   if (!env.TMUX) {
     return {
       status: 'skipped_not_tmux',
+      paneId: null,
+      desiredHeight: null,
+      duplicateCount: 0,
+    };
+  }
+
+  if (!isExplicitOmxOwnedTmuxEnv(env)) {
+    return {
+      status: 'skipped_not_omx_owned_tmux',
       paneId: null,
       desiredHeight: null,
       duplicateCount: 0,
@@ -72,19 +108,24 @@ export async function reconcileHudForPromptSubmit(
 
   const currentPaneId = env.TMUX_PANE?.trim();
   const panes = listPanes(currentPaneId);
-  const hudPaneIds = findHudWatchPaneIds(panes, currentPaneId);
+  const resolvedSessionId = deps.sessionId?.trim() || env.OMX_SESSION_ID?.trim() || undefined;
+  const hudPaneIds = findHudWatchPaneIds(panes, currentPaneId, {
+    sessionId: resolvedSessionId,
+    leaderPaneId: currentPaneId,
+  });
   const duplicateCount = Math.max(0, hudPaneIds.length - 1);
   const nonHudPaneCount = panes.filter((pane) => !isHudWatchPane(pane)).length;
-  const desiredHeight = HUD_TMUX_HEIGHT_LINES;
-
   const readHudConfigFn = deps.readHudConfig ?? readHudConfig;
   const hudConfig = await readHudConfigFn(cwd).catch(() => null);
+  const readAllStateFn = deps.readAllState ?? readAllState;
+  const hudState = hudConfig ? await readAllStateFn(cwd, hudConfig).catch(() => null) : null;
+  const desiredHeight = hudState ? getHudRenderMaxLines(hudState) : HUD_TMUX_HEIGHT_LINES;
   const preset = hudConfig?.preset;
-  const resolvedSessionId = deps.sessionId?.trim() || env.OMX_SESSION_ID?.trim() || undefined;
-  const hudCmd = buildHudWatchCommand(omxBin, preset, resolvedSessionId);
+  const hudCmd = buildHudWatchCommand(omxBin, preset, resolvedSessionId, env.OMX_ROOT, currentPaneId);
 
   if (hudPaneIds.length === 1) {
     const resized = resizePane(hudPaneIds[0], desiredHeight);
+    if (resized) ensureHudResizeHook(hudPaneIds[0], currentPaneId, desiredHeight, deps);
     return {
       status: resized ? 'resized' : 'failed',
       paneId: hudPaneIds[0],
@@ -92,6 +133,33 @@ export async function reconcileHudForPromptSubmit(
       duplicateCount,
     };
   }
+
+  if (hudPaneIds.length > 1) {
+    const [keeperPaneId, ...extraPaneIds] = hudPaneIds;
+    for (const paneId of extraPaneIds) {
+      killPane(paneId);
+    }
+    const resized = resizePane(keeperPaneId, desiredHeight);
+    if (resized) ensureHudResizeHook(keeperPaneId, currentPaneId, desiredHeight, deps);
+    return {
+      status: resized ? 'replaced_duplicates' : 'failed',
+      paneId: resized ? keeperPaneId : null,
+      desiredHeight,
+      duplicateCount,
+    };
+  }
+
+  if (!resolvedSessionId) {
+    return {
+      status: 'skipped_no_session_id',
+      paneId: null,
+      desiredHeight,
+      duplicateCount,
+    };
+  }
+
+  const unregisterHook = deps.unregisterHudResizeHook ?? unregisterHudResizeHook;
+  unregisterHook(currentPaneId);
 
   for (const paneId of hudPaneIds) {
     killPane(paneId);
@@ -112,6 +180,7 @@ export async function reconcileHudForPromptSubmit(
   }
 
   resizePane(paneId, desiredHeight);
+  ensureHudResizeHook(paneId, currentPaneId, desiredHeight, deps);
 
   return {
     status: hudPaneIds.length > 1 ? 'replaced_duplicates' : 'recreated',

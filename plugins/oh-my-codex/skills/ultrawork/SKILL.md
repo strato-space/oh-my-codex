@@ -16,7 +16,7 @@ Ultrawork is a parallel execution engine for high-throughput task completion. It
 
 <Do_Not_Use_When>
 - Task requires guaranteed completion with persistence, architect verification, or deslop/reverification -- use `ralph` instead (Ralph includes ultrawork)
-- Task requires a full autonomous pipeline -- use `autopilot` instead (autopilot includes Ralph which includes ultrawork)
+- Task requires a full autonomous pipeline -- use `autopilot` instead (autopilot defaults to Ultragoal, with Team/parallel execution used only when needed)
 - There is only one sequential task with no parallelism opportunity -- execute directly or delegate to a single `executor`
 - The request is still in plan-consensus mode -- keep planning artifacts in `ralplan` until execution is explicitly authorized
 - User needs session persistence for resume -- use `ralph`, which adds persistence on top of ultrawork
@@ -38,9 +38,8 @@ Sequential task execution wastes time when tasks are independent. Ultrawork keep
 - Auto-delegate `researcher` when official docs, version-aware framework guidance, best practices, or external dependency behavior materially affect task correctness; treat it as an evidence lane, not a replacement primary workflow.
 - Use `run_in_background: true` for operations over ~30 seconds (installs, builds, tests).
 - Run quick commands (git status, file reads, simple checks) in the foreground.
-- Default to concise, evidence-dense progress and completion reporting. If a lane is speculative or blocked, say so explicitly.
-- Treat newer user task updates as local overrides for the active workflow branch while preserving earlier non-conflicting constraints.
-- If the user says `continue` after ultrawork already has a clear next step, continue the current execution branch instead of restarting planning or asking for reconfirmation.
+- Apply the shared workflow guidance pattern: outcome-first framing, concise visible updates for speculative/blocked lanes, local overrides for the active workflow branch, evidence-backed validation, explicit stop rules, and continuation of clear safe execution branches instead of restarting or re-asking.
+- If the user says `continue`, continue the active workflow branch rather than restarting discovery or re-asking settled questions.
 </Execution_Policy>
 
 <Steps>
@@ -82,16 +81,16 @@ Sequential task execution wastes time when tasks are independent. Ultrawork keep
 
 ## State Management
 
-Use `omx_state` MCP tools for ultrawork lifecycle state.
+Use the CLI-first state surface (`omx state ... --json`) for ultrawork lifecycle state. If explicit MCP compatibility tools are already available, equivalent `omx_state` calls are optional compatibility, not the default.
 
 - **On start**:
-  `state_write({mode: "ultrawork", active: true, reinforcement_count: 1, started_at: "<now>"})`
+  `omx state write --input '{"mode":"ultrawork","active":true,"reinforcement_count":1,"started_at":"<now>"}' --json`
 - **On each reinforcement/loop step**:
-  `state_write({mode: "ultrawork", reinforcement_count: <current>})`
+  `omx state write --input '{"mode":"ultrawork","reinforcement_count":<current>}' --json`
 - **On completion**:
-  `state_write({mode: "ultrawork", active: false})`
+  `omx state write --input '{"mode":"ultrawork","active":false}' --json`
 - **On cancellation/cleanup**:
-  run `$cancel` (which should call `state_clear(mode="ultrawork")`)
+  run `$cancel` (which should call `omx state clear --input '{"mode":"ultrawork"}' --json`)
 
 <Examples>
 <Good>
@@ -106,7 +105,7 @@ Direct-tool lane:
 - update `skills/ultrawork/SKILL.md`
 
 Background evidence lane:
-- delegate(role="test-engineer", tier="STANDARD", task="Map which hook tests cover ultrawork activation messaging", model="...")
+- use /prompts:test-engineer for this scoped task
 ```
 Why good: Context is grounded first, acceptance criteria are explicit, and the direct-tool lane runs alongside a bounded evidence lane.
 </Good>
@@ -123,8 +122,8 @@ Why good: Shared-file work stays local; independent evidence work fans out.
 <Bad>
 Parallelizing before the task is grounded:
 ```
-delegate(role="executor", tier="STANDARD", task="Implement whatever seems necessary", model="...")
-delegate(role="test-engineer", tier="STANDARD", task="Figure out how to test it later", model="...")
+use /prompts:executor for this scoped task
+use /prompts:test-engineer for this scoped task
 ```
 Why bad: No context snapshot, no pass/fail target, and delegation starts before the work is shaped.
 </Bad>

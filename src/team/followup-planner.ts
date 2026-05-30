@@ -39,6 +39,7 @@ export interface ResolveAvailableAgentTypesOptions {
 }
 
 export interface BuildFollowupStaffingPlanOptions {
+  codexHomeOverride?: string;
   workerCount?: number;
   fallbackRole?: string;
 }
@@ -140,9 +141,10 @@ function mergeAllocation(
   role: string,
   count: number,
   reason: string,
+  codexHomeOverride?: string,
 ): void {
   if (count <= 0) return;
-  const reasoningEffort = resolveAgentReasoningEffort(role);
+  const reasoningEffort = resolveAgentReasoningEffort(role, codexHomeOverride);
   const existing = allocations.find(
     (item) => item.role === role && item.reason === reason && item.reasoningEffort === reasoningEffort,
   );
@@ -250,13 +252,13 @@ function pickSpecialistRole(
   }
 
   if (/(security|auth|authorization|authentication|xss|injection|cve|vulnerability)/.test(normalizedTask)) {
-    return chooseDistinctAvailableRole(availableRoles, ['security-reviewer', 'architect'], fallbackRole, [primaryRole]);
+    return chooseDistinctAvailableRole(availableRoles, ['code-reviewer', 'architect'], fallbackRole, [primaryRole]);
   }
   if (/(debug|regression|root cause|stack trace|incident|flaky)/.test(normalizedTask)) {
     return chooseDistinctAvailableRole(availableRoles, ['debugger', 'architect'], fallbackRole, [primaryRole]);
   }
   if (/(build|compile|tsc|type error|lint)/.test(normalizedTask)) {
-    return chooseDistinctAvailableRole(availableRoles, ['build-fixer', 'debugger'], fallbackRole, [primaryRole]);
+    return chooseDistinctAvailableRole(availableRoles, ['debugger', 'executor'], fallbackRole, [primaryRole]);
   }
   if (/(ui|ux|layout|css|responsive|design|frontend)/.test(normalizedTask)) {
     return chooseDistinctAvailableRole(availableRoles, ['designer'], fallbackRole, [primaryRole]);
@@ -290,31 +292,37 @@ export function buildFollowupStaffingPlan(
   );
   const allocations: FollowupAllocation[] = [];
 
-  mergeAllocation(allocations, primaryRole, 1, mode === 'team' ? 'primary delivery lane' : 'primary implementation lane');
+  mergeAllocation(
+    allocations,
+    primaryRole,
+    1,
+    mode === 'team' ? 'primary delivery lane' : 'primary implementation lane',
+    options.codexHomeOverride,
+  );
 
   if (mode === 'team') {
     if (workerCount >= 2) {
-      mergeAllocation(allocations, qualityRole, 1, 'verification + regression lane');
+      mergeAllocation(allocations, qualityRole, 1, 'verification + regression lane', options.codexHomeOverride);
     }
     if (workerCount >= 3) {
       const specialistRole = pickSpecialistRole(task, availableAgentTypes, primaryRole, primaryRole);
-      mergeAllocation(allocations, specialistRole, 1, 'specialist support lane');
+      mergeAllocation(allocations, specialistRole, 1, 'specialist support lane', options.codexHomeOverride);
     }
     if (workerCount >= 4) {
-      mergeAllocation(allocations, primaryRole, workerCount - 3, 'extra implementation capacity');
+      mergeAllocation(allocations, primaryRole, workerCount - 3, 'extra implementation capacity', options.codexHomeOverride);
     }
   } else {
-    mergeAllocation(allocations, qualityRole, 1, 'evidence + regression checks');
+    mergeAllocation(allocations, qualityRole, 1, 'evidence + regression checks', options.codexHomeOverride);
     const architectRole = chooseAvailableRole(
       availableAgentTypes,
       ['architect', 'critic', 'verifier'],
       qualityRole,
     );
-    mergeAllocation(allocations, architectRole, 1, 'final architecture / completion sign-off');
+    mergeAllocation(allocations, architectRole, 1, 'final architecture / completion sign-off', options.codexHomeOverride);
 
     if (workerCount >= 4) {
       const specialistRole = pickSpecialistRole(task, availableAgentTypes, primaryRole, primaryRole);
-      mergeAllocation(allocations, specialistRole, workerCount - 3, 'parallel specialist follow-up capacity');
+      mergeAllocation(allocations, specialistRole, workerCount - 3, 'parallel specialist follow-up capacity', options.codexHomeOverride);
     }
   }
 

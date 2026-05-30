@@ -1,34 +1,16 @@
 ---
 name: frontend-ui-ux
-description: Designer-developer for UI/UX work
+description: Deprecated compatibility shim for frontend UI/UX work; use $design or $visual-ralph
 ---
 
-# Frontend UI/UX Command
+# Frontend UI/UX compatibility shim
 
-Routes to the designer agent or Gemini MCP for frontend work.
+Hard-deprecated. Do not invoke or route this skill for new work.
 
-## Usage
+Use `$design` when the task needs product/design context, UX guidance, frontend planning, design-system alignment, or a repo-local `DESIGN.md` source of truth.
 
-```
-/frontend-ui-ux <design task>
-```
+Use `$visual-ralph` when the task needs implementation against an approved generated/static/live-URL visual reference with screenshot capture, Visual Ralph verdict scoring, and pixel-diff evidence.
 
-## Routing
-
-### Preferred: MCP Direct
-Before first MCP tool use, call `ToolSearch("mcp")` to discover deferred MCP tools.
-Use `mcp__g__ask_gemini` with `agent_role: "designer"` for design tasks.
-If ToolSearch finds no MCP tools, use the Codex agent fallback below.
-
-### Fallback: Codex Agent
-```
-delegate(role="designer", tier="STANDARD", task="{{ARGUMENTS}}")
-```
-
-## Capabilities
-- Component design and implementation
-- Responsive layouts
-- Design system consistency
-- Accessibility compliance
+This file exists only to preserve the public/catalog-visible `frontend-ui-ux` compatibility contract while canonical design guidance is handled by `$design` and measured visual implementation is handled by `$visual-ralph`.
 
 Task: {{ARGUMENTS}}

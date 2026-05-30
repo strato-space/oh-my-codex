@@ -3,7 +3,6 @@ import { join, dirname, resolve, sep } from 'path';
 import { existsSync } from 'fs';
 import { randomUUID } from 'crypto';
 import { readUsableSessionState } from '../hooks/session.js';
-import { omxStateDir } from '../utils/paths.js';
 import { isTerminalPhase, type TeamPhase, type TerminalPhase } from './orchestrator.js';
 import {
   computeTaskReadiness as computeTaskReadinessImpl,
@@ -67,6 +66,8 @@ import {
 } from './contracts.js';
 import type { TeamReminderIntent } from './reminder-intents.js';
 import type { WorktreeMode } from './worktree.js';
+import { resolveCanonicalTeamStateRoot } from './state-root.js';
+import { normalizeTeamTaskCoordinationPlanForStorage } from './coordination-protocol.js';
 
 export type { TeamDispatchRequestStatus, TeamWorkerIntegrationStatus } from './contracts.js';
 
@@ -96,6 +97,9 @@ export interface TeamConfig {
   resize_hook_target: string | null;
   /** Monotonic counter for worker index assignment during scaling. */
   next_worker_index?: number;
+  display_name?: string;
+  requested_name?: string;
+  identity_source?: string;
 }
 
 export interface WorkerInfo {
@@ -129,6 +133,52 @@ export interface WorkerStatus {
   updated_at: string;
 }
 
+export type TeamTaskDelegationMode = 'none' | 'optional' | 'auto' | 'required';
+export type TeamTaskChildModelPolicy = 'standard' | 'fast' | 'inherit' | 'frontier';
+
+export interface TeamTaskDelegationComplianceEvidence {
+  status: 'spawned' | 'skipped';
+  source: 'terminal_result';
+  detail: string;
+  recorded_at: string;
+}
+
+export type TeamTaskCoordinationMode = 'lightweight' | 'coordinated';
+
+export type TeamTaskCoordinationMechanism =
+  | 'shared_mental_model'
+  | 'closed_loop_communication'
+  | 'mutual_performance_monitoring'
+  | 'backup_behavior'
+  | 'adaptability_checkpoint'
+  | 'team_orientation';
+
+export interface TeamTaskCoordinationPlan {
+  mode: TeamTaskCoordinationMode;
+  activation_reasons: string[];
+  required_mechanisms?: TeamTaskCoordinationMechanism[];
+  source?: 'explicit' | 'synthesized';
+}
+
+export interface TeamTaskCoordinationComplianceEvidence {
+  status: 'checked' | 'no_boundary_handoff';
+  source: 'terminal_result';
+  detail: string;
+  recorded_at: string;
+}
+
+export interface TeamTaskDelegationPlan {
+  mode: TeamTaskDelegationMode;
+  max_parallel_subtasks?: number;
+  required_parallel_probe?: boolean;
+  spawn_before_serial_search_threshold?: number;
+  child_model_policy?: TeamTaskChildModelPolicy;
+  child_model?: string;
+  subtask_candidates?: string[];
+  child_report_format?: 'bullets' | 'json';
+  skip_allowed_reason_required?: boolean;
+}
+
 export interface TeamTask {
   id: string;
   subject: string;
@@ -141,10 +191,18 @@ export interface TeamTask {
   error?: string; // failure reason
   blocked_by?: string[]; // task IDs
   depends_on?: string[]; // task IDs
+  filePaths?: string[];
+  domains?: string[];
+  lane?: string;
+  allocation_reason?: string;
   version?: number;
   claim?: TeamTaskClaim;
   created_at: string;
   completed_at?: string;
+  delegation?: TeamTaskDelegationPlan;
+  delegation_compliance?: TeamTaskDelegationComplianceEvidence;
+  coordination?: TeamTaskCoordinationPlan;
+  coordination_compliance?: TeamTaskCoordinationComplianceEvidence;
 }
 
 export interface TeamTaskClaim {
@@ -238,6 +296,7 @@ export interface TeamManifestV2 {
   governance: TeamGovernance;
   lifecycle_profile: 'default';
   permissions_snapshot: PermissionsSnapshot;
+  team_decomposition?: Record<string, unknown>;
   tmux_session: string;
   worker_count: number;
   workers: WorkerInfo[];
@@ -253,12 +312,18 @@ export interface TeamManifestV2 {
   resize_hook_target: string | null;
   /** Monotonic counter for worker index assignment during scaling. */
   next_worker_index?: number;
+  display_name?: string;
+  requested_name?: string;
+  identity_source?: string;
 }
 
 export interface TeamWorkspaceMetadata {
   leader_cwd?: string;
   team_state_root?: string;
   workspace_mode?: 'single' | 'worktree';
+  display_name?: string;
+  requested_name?: string;
+  identity_source?: string;
   worktree_mode?: WorktreeMode;
 }
 
@@ -324,7 +389,7 @@ export type ClaimTaskResult =
 
 export type TransitionTaskResult =
   | { ok: true; task: TeamTaskV2 }
-  | { ok: false; error: 'claim_conflict' | 'invalid_transition' | 'task_not_found' | 'already_terminal' | 'lease_expired' };
+  | { ok: false; error: 'claim_conflict' | 'invalid_transition' | 'task_not_found' | 'already_terminal' | 'lease_expired' | 'missing_delegation_compliance_evidence' | 'missing_coordination_compliance_evidence' };
 
 export type ReleaseTaskClaimResult =
   | { ok: true; task: TeamTaskV2 }
@@ -536,23 +601,29 @@ async function resolveLeaderSessionId(cwd: string, env: NodeJS.ProcessEnv): Prom
 }
 
 function normalizeTask(task: TeamTask): TeamTaskV2 {
+  const normalizedCoordination = normalizeTeamTaskCoordinationPlanForStorage(task.coordination);
+  const { coordination: _coordination, ...rest } = task;
   return {
-    ...task,
+    ...rest,
     depends_on: task.depends_on ?? task.blocked_by ?? [],
+    ...(normalizedCoordination ? { coordination: normalizedCoordination } : {}),
     version: Math.max(1, task.version ?? 1),
   };
 }
 
 // Team state directory: .omx/state/team/{teamName}/
 function resolveTeamStateRoot(cwd: string, env: NodeJS.ProcessEnv = process.env): string {
-  const explicit = env.OMX_TEAM_STATE_ROOT;
-  if (typeof explicit === 'string' && explicit.trim() !== '') {
-    return resolve(cwd, explicit.trim());
+  return resolveCanonicalTeamStateRoot(cwd, env);
+}
+
+function assertSafeTeamName(teamName: string): void {
+  if (!TEAM_NAME_SAFE_PATTERN.test(teamName)) {
+    throw new Error(`invalid_team_name:${teamName}`);
   }
-  return omxStateDir(cwd);
 }
 
 function teamDir(teamName: string, cwd: string): string {
+  assertSafeTeamName(teamName);
   return join(resolveTeamStateRoot(cwd), 'team', teamName);
 }
 
@@ -774,6 +845,9 @@ export async function initTeamState(
     resize_hook_name: null,
     resize_hook_target: null,
     next_worker_index: workerCount + 1,
+    display_name: workspace.display_name,
+    requested_name: workspace.requested_name,
+    identity_source: workspace.identity_source,
   };
 
   await writeAtomic(join(root, 'config.json'), JSON.stringify(config, null, 2));
@@ -816,6 +890,9 @@ export async function initTeamState(
       resize_hook_name: null,
       resize_hook_target: null,
       next_worker_index: workerCount + 1,
+      display_name: workspace.display_name,
+      requested_name: workspace.requested_name,
+      identity_source: workspace.identity_source,
     },
     cwd
   );
@@ -847,6 +924,9 @@ async function writeConfig(cfg: TeamConfig, cwd: string): Promise<void> {
       resize_hook_name: normalized.resize_hook_name,
       resize_hook_target: normalized.resize_hook_target,
       next_worker_index: normalized.next_worker_index ?? existing.next_worker_index,
+      display_name: normalized.display_name ?? existing.display_name,
+      requested_name: normalized.requested_name ?? existing.requested_name,
+      identity_source: normalized.identity_source ?? existing.identity_source,
     };
     await writeTeamManifestV2(merged, cwd);
   }
@@ -879,6 +959,9 @@ function teamConfigFromManifest(manifest: TeamManifestV2): TeamConfig {
     resize_hook_name: manifest.resize_hook_name,
     resize_hook_target: manifest.resize_hook_target,
     next_worker_index: manifest.next_worker_index,
+    display_name: manifest.display_name,
+    requested_name: manifest.requested_name,
+    identity_source: manifest.identity_source,
   };
 }
 
@@ -929,6 +1012,9 @@ function teamManifestFromConfig(config: TeamConfig): TeamManifestV2 {
     resize_hook_name: normalized.resize_hook_name,
     resize_hook_target: normalized.resize_hook_target,
     next_worker_index: normalized.next_worker_index,
+    display_name: normalized.display_name,
+    requested_name: normalized.requested_name,
+    identity_source: normalized.identity_source,
   };
 }
 
@@ -968,6 +1054,10 @@ export async function readTeamManifestV2(teamName: string, cwd: string): Promise
       policy?: Partial<TeamPolicy> & Partial<TeamGovernance>;
       governance?: Partial<TeamGovernance>;
     };
+    const legacyPolicy = parsedManifest.policy as (Partial<TeamPolicy> & Partial<TeamGovernance> & {
+      team_decomposition?: unknown;
+    }) | undefined;
+    const legacyTeamDecomposition = legacyPolicy?.team_decomposition;
     return {
       ...parsedManifest,
       policy: normalizeTeamPolicy(parsedManifest.policy, {
@@ -975,6 +1065,10 @@ export async function readTeamManifestV2(teamName: string, cwd: string): Promise
         worker_launch_mode: parsedManifest.policy?.worker_launch_mode === 'prompt' ? 'prompt' : 'interactive',
       }),
       governance: normalizeTeamGovernance(parsedManifest.governance, parsedManifest.policy),
+      team_decomposition: parsedManifest.team_decomposition
+        ?? (legacyTeamDecomposition && typeof legacyTeamDecomposition === 'object' && !Array.isArray(legacyTeamDecomposition)
+          ? legacyTeamDecomposition as Record<string, unknown>
+          : undefined),
       lifecycle_profile: 'default',
     };
   } catch {
@@ -1190,12 +1284,15 @@ export async function createTask(
     const nextId = String(nextNumeric);
 
     const created: TeamTaskV2 = {
-      ...task,
+      ...normalizeTask({
+        ...task,
+        id: nextId,
+        created_at: new Date().toISOString(),
+      }),
       id: nextId,
       status: task.status ?? 'pending',
       depends_on: task.depends_on ?? task.blocked_by ?? [],
       version: 1,
-      created_at: new Date().toISOString(),
     };
 
     await writeAtomic(taskFilePath(teamName, nextId, cwd), JSON.stringify(created, null, 2));
@@ -1238,14 +1335,14 @@ export async function updateTask(
     const rawDeps = updates.depends_on ?? updates.blocked_by ?? existing.depends_on ?? existing.blocked_by ?? [];
     const normalizedDeps = Array.isArray(rawDeps) ? rawDeps : [];
 
-    const merged: TeamTaskV2 = {
+    const merged = normalizeTask({
       ...normalizeTask(existing),
       ...updates,
       id: existing.id,
       created_at: existing.created_at,
       depends_on: normalizedDeps,
       version: Math.max(1, existing.version ?? 1) + 1,
-    };
+    });
 
     await writeAtomic(taskFilePath(teamName, taskId, cwd), JSON.stringify(merged, null, 2));
     return merged;
@@ -2067,7 +2164,7 @@ export async function markOwnedTeamsLeaderStopObserved(
   source: TeamLeaderAttentionState['source'] = 'native_stop',
 ): Promise<string[]> {
   if (!leaderSessionId.trim()) return [];
-  const teamsRoot = join(omxStateDir(cwd), 'team');
+  const teamsRoot = join(resolveTeamStateRoot(cwd), 'team');
   if (!existsSync(teamsRoot)) return [];
   const entries = await readdir(teamsRoot, { withFileTypes: true }).catch(() => []);
   const updatedTeams: string[] = [];

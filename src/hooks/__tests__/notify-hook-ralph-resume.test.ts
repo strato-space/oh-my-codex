@@ -126,6 +126,71 @@ async function withPatchedEnv<T>(
 }
 
 describe('notify-hook Ralph session resume', () => {
+  it('does not mark normal native turn-complete notifications as subagent completion', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-notify-subagent-normal-turn-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const sessionId = 'sess-normal-turn';
+      const leaderThreadId = 'leader-thread';
+      const subagentThreadId = 'subagent-thread';
+      const startedAt = '2026-03-17T00:00:00.000Z';
+      await writeJson(join(stateDir, 'session.json'), { session_id: sessionId });
+      await writeJson(join(stateDir, 'subagent-tracking.json'), {
+        schemaVersion: 1,
+        sessions: {
+          [sessionId]: {
+            session_id: sessionId,
+            leader_thread_id: leaderThreadId,
+            updated_at: startedAt,
+            threads: {
+              [leaderThreadId]: {
+                thread_id: leaderThreadId,
+                kind: 'leader',
+                first_seen_at: startedAt,
+                last_seen_at: startedAt,
+                turn_count: 1,
+              },
+              [subagentThreadId]: {
+                thread_id: subagentThreadId,
+                kind: 'subagent',
+                first_seen_at: startedAt,
+                last_seen_at: startedAt,
+                turn_count: 1,
+              },
+            },
+          },
+        },
+      });
+
+      const result = runNotifyHook(
+        buildPayload(wd, {
+          session_id: sessionId,
+          thread_id: subagentThreadId,
+          turn_id: 'turn-normal-complete',
+          source: 'native',
+          input_messages: ['ordinary native subagent turn'],
+        }),
+        {
+          OMX_ROOT: '',
+          OMX_STATE_ROOT: '',
+          OMX_TEAM_STATE_ROOT: '',
+          OMX_SESSION_ID: '',
+          OMX_NOTIFY_HOOK_TRUSTED_MANAGED_CWD: wd,
+        },
+      );
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const tracking = JSON.parse(await readFile(join(stateDir, 'subagent-tracking.json'), 'utf-8'));
+      const subagentThread = tracking.sessions?.[sessionId]?.threads?.[subagentThreadId];
+      assert.equal(subagentThread?.completed_at, undefined);
+      assert.equal(subagentThread?.last_completed_turn_id, undefined);
+      assert.equal(subagentThread?.completion_source, undefined);
+      assert.equal(subagentThread?.last_turn_id, 'turn-normal-complete');
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it('resumes a matching prior Ralph into the current OMX session and rebinds the pane', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-notify-ralph-resume-'));
     try {
@@ -331,6 +396,172 @@ describe('notify-hook Ralph session resume', () => {
       assert.equal(priorState.active, false);
       assert.equal(priorState.current_phase, 'cancelled');
       assert.equal(priorState.stop_reason, 'ownership_transferred');
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+
+
+  it('marks a stale active current-session Ralph state abandoned instead of rebinding it', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-notify-ralph-stale-current-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const currentOmxSessionId = 'sess-current';
+      const currentSessionDir = join(stateDir, 'sessions', currentOmxSessionId);
+      await writeJson(join(stateDir, 'session.json'), { session_id: currentOmxSessionId });
+      await writeJson(join(currentSessionDir, 'ralph-state.json'), {
+        active: true,
+        iteration: 0,
+        max_iterations: 50,
+        current_phase: 'starting',
+        updated_at: '2026-02-22T00:00:00.000Z',
+        owner_omx_session_id: currentOmxSessionId,
+        owner_codex_session_id: 'codex-session-1',
+      });
+
+      const result = await reconcileRalphSessionResume({
+        stateDir,
+        payloadSessionId: 'codex-session-1',
+        payloadThreadId: 'thread-stale-current',
+        env: { OMX_RALPH_ACTIVE_STATE_STALE_MS: '1000' },
+      });
+
+      assert.equal(result.resumed, false);
+      assert.equal(result.reason, 'current_ralph_abandoned_stale');
+      const currentState = JSON.parse(
+        await readFile(join(currentSessionDir, 'ralph-state.json'), 'utf-8'),
+      ) as Record<string, unknown>;
+      assert.equal(currentState.active, false);
+      assert.equal(currentState.current_phase, 'cancelled');
+      assert.equal(currentState.stop_reason, 'stale_active_state');
+      assert.equal(typeof currentState.abandoned_at, 'string');
+      assert.equal(currentState.stale_resume_threshold_ms, 1000);
+      assert.equal(currentState.stale_resume_timestamp_source, 'updated_at');
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps active current-session Ralph state when fresh turn activity is newer than stale updated_at', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-notify-ralph-fresh-current-turn-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const currentOmxSessionId = 'sess-current';
+      const currentSessionDir = join(stateDir, 'sessions', currentOmxSessionId);
+      const lastTurnAt = new Date().toISOString();
+      await writeJson(join(stateDir, 'session.json'), { session_id: currentOmxSessionId });
+      await writeJson(join(currentSessionDir, 'ralph-state.json'), {
+        active: true,
+        iteration: 0,
+        max_iterations: 50,
+        current_phase: 'executing',
+        updated_at: '2026-02-22T00:00:00.000Z',
+        last_turn_at: lastTurnAt,
+        owner_omx_session_id: currentOmxSessionId,
+        owner_codex_session_id: 'codex-session-1',
+      });
+
+      const result = await reconcileRalphSessionResume({
+        stateDir,
+        payloadSessionId: 'codex-session-1',
+        payloadThreadId: 'thread-fresh-current',
+        env: { OMX_RALPH_ACTIVE_STATE_STALE_MS: '60000' },
+      });
+
+      assert.equal(result.resumed, false);
+      assert.equal(result.reason, 'current_ralph_active');
+      const currentState = JSON.parse(
+        await readFile(join(currentSessionDir, 'ralph-state.json'), 'utf-8'),
+      ) as Record<string, unknown>;
+      assert.equal(currentState.active, true);
+      assert.equal(currentState.current_phase, 'executing');
+      assert.equal(currentState.stop_reason, undefined);
+      assert.equal(currentState.abandoned_at, undefined);
+      assert.equal(currentState.last_turn_at, lastTurnAt);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('marks a stale matching prior Ralph abandoned instead of auto-resuming it', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-notify-ralph-stale-prior-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const currentOmxSessionId = 'sess-current';
+      const priorOmxSessionId = 'sess-prior';
+      const currentSessionDir = join(stateDir, 'sessions', currentOmxSessionId);
+      const priorSessionDir = join(stateDir, 'sessions', priorOmxSessionId);
+      await writeJson(join(stateDir, 'session.json'), { session_id: currentOmxSessionId });
+      await mkdir(currentSessionDir, { recursive: true });
+      await writeJson(join(priorSessionDir, 'ralph-state.json'), {
+        active: true,
+        iteration: 0,
+        max_iterations: 50,
+        current_phase: 'starting',
+        updated_at: '2026-02-22T00:00:00.000Z',
+        owner_omx_session_id: priorOmxSessionId,
+        owner_codex_session_id: 'codex-session-1',
+      });
+
+      const result = await reconcileRalphSessionResume({
+        stateDir,
+        payloadSessionId: 'codex-session-1',
+        payloadThreadId: 'thread-stale-prior',
+        env: { OMX_RALPH_ACTIVE_STATE_STALE_MS: '1000' },
+      });
+
+      assert.equal(result.resumed, false);
+      assert.equal(result.reason, 'matching_prior_ralph_abandoned_stale');
+      assert.equal(existsSync(join(currentSessionDir, 'ralph-state.json')), false);
+      const priorState = JSON.parse(
+        await readFile(join(priorSessionDir, 'ralph-state.json'), 'utf-8'),
+      ) as Record<string, unknown>;
+      assert.equal(priorState.active, false);
+      assert.equal(priorState.current_phase, 'cancelled');
+      assert.equal(priorState.stop_reason, 'stale_active_state');
+      assert.equal(typeof priorState.abandoned_at, 'string');
+      assert.equal(priorState.stale_resume_timestamp_source, 'updated_at');
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('treats interrupted Ralph state as terminal and not resumable', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-notify-ralph-interrupted-terminal-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const currentOmxSessionId = 'sess-current';
+      const priorOmxSessionId = 'sess-prior';
+      const currentSessionDir = join(stateDir, 'sessions', currentOmxSessionId);
+      const priorSessionDir = join(stateDir, 'sessions', priorOmxSessionId);
+      await writeJson(join(stateDir, 'session.json'), { session_id: currentOmxSessionId });
+      await mkdir(currentSessionDir, { recursive: true });
+      await writeJson(join(priorSessionDir, 'ralph-state.json'), {
+        active: true,
+        iteration: 1,
+        max_iterations: 50,
+        current_phase: 'interrupted',
+        updated_at: '2026-02-22T00:00:00.000Z',
+        owner_omx_session_id: priorOmxSessionId,
+        owner_codex_session_id: 'codex-session-1',
+      });
+
+      const result = await reconcileRalphSessionResume({
+        stateDir,
+        payloadSessionId: 'codex-session-1',
+        payloadThreadId: 'thread-interrupted',
+        env: { OMX_RALPH_ACTIVE_STATE_STALE_MS: '1000' },
+      });
+
+      assert.equal(result.resumed, false);
+      assert.equal(result.reason, 'no_matching_prior_ralph');
+      assert.equal(existsSync(join(currentSessionDir, 'ralph-state.json')), false);
+      const priorState = JSON.parse(
+        await readFile(join(priorSessionDir, 'ralph-state.json'), 'utf-8'),
+      ) as Record<string, unknown>;
+      assert.equal(priorState.active, true);
+      assert.equal(priorState.current_phase, 'interrupted');
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

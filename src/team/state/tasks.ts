@@ -5,6 +5,8 @@ import { readFile, readdir } from 'fs/promises';
 import type { TeamTaskStatus } from '../contracts.js';
 import type {
   TeamTask,
+  TeamTaskCoordinationComplianceEvidence,
+  TeamTaskDelegationComplianceEvidence,
   TeamTaskV2,
   TaskReadiness,
   ClaimTaskResult,
@@ -112,6 +114,62 @@ export async function claimTask(
   return lock.value;
 }
 
+function extractDelegationComplianceEvidence(
+  task: TeamTaskV2,
+  terminalData: { result?: string; error?: string } | undefined,
+): TeamTaskDelegationComplianceEvidence | null {
+  const plan = task.delegation;
+  if (!plan || plan.mode === 'none') return null;
+  if (plan.mode === 'optional' && plan.required_parallel_probe !== true) return null;
+
+  const result = typeof terminalData?.result === 'string' ? terminalData.result : '';
+  const spawnMatch = result.match(/^\s*Subagent spawn evidence:\s*(.+)$/im);
+  if (spawnMatch?.[1]?.trim()) {
+    const detail = spawnMatch[1].trim();
+    if (!/^none\b|^0\b/i.test(detail)) {
+      return { status: 'spawned', source: 'terminal_result', detail, recorded_at: new Date().toISOString() };
+    }
+  }
+
+  if (plan.skip_allowed_reason_required === true) {
+    const skipMatch = result.match(/^\s*Subagent skip reason:\s*(.+)$/im);
+    if (skipMatch?.[1]?.trim()) {
+      return { status: 'skipped', source: 'terminal_result', detail: skipMatch[1].trim(), recorded_at: new Date().toISOString() };
+    }
+  }
+
+  return null;
+}
+
+function requiresDelegationComplianceEvidence(task: TeamTaskV2): boolean {
+  const plan = task.delegation;
+  return !!plan && (plan.mode === 'auto' || plan.mode === 'required' || plan.required_parallel_probe === true);
+}
+
+function extractCoordinationComplianceEvidence(
+  task: TeamTaskV2,
+  terminalData: { result?: string; error?: string } | undefined,
+): TeamTaskCoordinationComplianceEvidence | null {
+  if (task.coordination?.mode !== 'coordinated') return null;
+
+  const result = typeof terminalData?.result === 'string' ? terminalData.result : '';
+  const checkedMatch = result.match(/^\s*Coordination protocol:\s*coordinated\s*[-:]\s*(.+)$/im);
+  if (checkedMatch?.[1]?.trim()) {
+    return { status: 'checked', source: 'terminal_result', detail: checkedMatch[1].trim(), recorded_at: new Date().toISOString() };
+  }
+
+  const noBoundaryMatch = result.match(/^\s*Coordination protocol:\s*no boundary handoff(?: remained)?\s*[-:]\s*(.+)$/im);
+  if (noBoundaryMatch?.[1]?.trim()) {
+    return { status: 'no_boundary_handoff', source: 'terminal_result', detail: noBoundaryMatch[1].trim(), recorded_at: new Date().toISOString() };
+  }
+
+  return null;
+}
+
+function requiresCoordinationComplianceEvidence(task: TeamTaskV2): boolean {
+  return task.coordination?.mode === 'coordinated';
+}
+
 interface TransitionDeps extends ClaimTaskDeps {
   canTransitionTaskStatus: (from: TeamTaskStatus, to: TeamTaskStatus) => boolean;
   appendTeamEvent: (
@@ -155,12 +213,27 @@ export async function transitionTaskStatus(
 
     const normalizedResult = typeof terminalData?.result === 'string' ? terminalData.result : undefined;
     const normalizedError = typeof terminalData?.error === 'string' ? terminalData.error : undefined;
+    const delegationCompliance = to === 'completed'
+      ? extractDelegationComplianceEvidence(v, terminalData)
+      : null;
+    const coordinationCompliance = to === 'completed'
+      ? extractCoordinationComplianceEvidence(v, terminalData)
+      : null;
+    if (to === 'completed' && requiresDelegationComplianceEvidence(v) && !delegationCompliance) {
+      return { ok: false as const, error: 'missing_delegation_compliance_evidence' as const };
+    }
+    if (to === 'completed' && requiresCoordinationComplianceEvidence(v) && !coordinationCompliance) {
+      return { ok: false as const, error: 'missing_coordination_compliance_evidence' as const };
+    }
+
     const updated: TeamTaskV2 = {
       ...v,
       status: to,
       completed_at: new Date().toISOString(),
       result: to === 'completed' ? normalizedResult : undefined,
       error: to === 'failed' ? normalizedError : undefined,
+      delegation_compliance: to === 'completed' ? delegationCompliance ?? v.delegation_compliance : v.delegation_compliance,
+      coordination_compliance: to === 'completed' ? coordinationCompliance ?? v.coordination_compliance : v.coordination_compliance,
       claim: undefined,
       version: v.version + 1,
     };

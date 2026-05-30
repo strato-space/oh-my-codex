@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/omx-api",
   "crates/omx-explore",
   "crates/omx-mux",
   "crates/omx-runtime-core",
@@ -10,7 +11,7 @@ resolver = "2"
 
 [workspace.package]
 
-version = "0.15.0"
+version = "0.18.6"
 
 edition = "2021"
 rust-version = "1.73"

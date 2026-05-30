@@ -56,6 +56,7 @@ describe('notify-hook cross-worktree heartbeat resolution', () => {
       const cwd = join(root, 'latest-input-preview');
       await mkdir(join(cwd, '.omx', 'logs'), { recursive: true });
       await mkdir(join(cwd, '.omx', 'state'), { recursive: true });
+      await writeFile(join(cwd, '.omx', 'managed'), 'test fixture managed workspace');
 
       const payload = {
         cwd,
@@ -93,6 +94,14 @@ describe('notify-hook cross-worktree heartbeat resolution', () => {
       const leaderWorkerDir = join(leaderCwd, '.omx', 'state', 'team', teamName, 'workers', workerName);
       await mkdir(leaderWorkerDir, { recursive: true });
       await mkdir(workerCwd, { recursive: true });
+      await writeFile(join(leaderWorkerDir, 'identity.json'), JSON.stringify({
+        name: workerName,
+        index: 1,
+        role: 'executor',
+        assigned_tasks: [],
+        worktree_path: workerCwd,
+        team_state_root: join(leaderCwd, '.omx', 'state'),
+      }, null, 2));
 
       const result = runWorkerNotify(workerCwd, `${teamName}/${workerName}`, {
         OMX_TEAM_STATE_ROOT: join(leaderCwd, '.omx', 'state'),
@@ -119,6 +128,14 @@ describe('notify-hook cross-worktree heartbeat resolution', () => {
       const leaderWorkerDir = join(leaderCwd, '.omx', 'state', 'team', teamName, 'workers', workerName);
       await mkdir(leaderWorkerDir, { recursive: true });
       await mkdir(workerCwd, { recursive: true });
+      await writeFile(join(leaderWorkerDir, 'identity.json'), JSON.stringify({
+        name: workerName,
+        index: 1,
+        role: 'executor',
+        assigned_tasks: [],
+        worktree_path: workerCwd,
+        team_state_root: join(leaderCwd, '.omx', 'state'),
+      }, null, 2));
 
       const result = runWorkerNotify(workerCwd, `${teamName}/${workerName}`, {
         OMX_TEAM_STATE_ROOT: join(leaderCwd, '.omx', 'state'),
@@ -153,6 +170,7 @@ describe('notify-hook cross-worktree heartbeat resolution', () => {
           index: 1,
           role: 'executor',
           assigned_tasks: [],
+          worktree_path: workerCwd,
           team_state_root: teamStateRoot,
         }, null, 2),
       );

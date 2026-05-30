@@ -1,17 +1,17 @@
 import { execFileSync, spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
-import { basename } from 'node:path';
+import { existsSync, readdirSync, renameSync, writeFileSync, readFileSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import { stdin as processStdin, stdout as processStdout } from 'node:process';
 import { parsePaneIdFromTmuxOutput } from '../hud/tmux.js';
 import { buildSendPaneArgvs } from '../notifications/tmux-detector.js';
 import { sleepSync } from '../utils/sleep.js';
 import { sanitizeReplyInput } from '../notifications/reply-listener.js';
 import { getCurrentTmuxPaneId } from '../notifications/tmux.js';
-import { getStatePath } from '../mcp/state-paths.js';
+import { getStateDir, getStatePath } from '../mcp/state-paths.js';
 import { TRACKED_WORKFLOW_MODES } from '../state/workflow-transition.js';
 import { resolveTmuxBinaryForPlatform } from '../utils/platform-command.js';
 import { resolveOmxCliEntryPath } from '../utils/paths.js';
-import type { QuestionAnswer, QuestionRendererState } from './types.js';
+import type { QuestionAnswer, QuestionRecord, QuestionRendererState } from './types.js';
 
 export type QuestionRendererStrategy = 'inside-tmux' | 'detached-tmux' | 'inline-tty' | 'windows-console' | 'test-noop' | 'unsupported';
 
@@ -90,6 +90,70 @@ export function resolveQuestionRendererStrategy(
     return 'inline-tty';
   }
   return 'unsupported';
+}
+
+
+function lineCount(value: string | undefined): number {
+  if (!value) return 0;
+  return Math.max(1, value.split('\n').length);
+}
+
+export function estimateQuestionContentLines(record: QuestionRecord | null | undefined): number {
+  if (!record) return 24;
+  const questions = record.questions?.length
+    ? record.questions
+    : [{
+      header: record.header,
+      question: record.question,
+      options: record.options,
+      allow_other: record.allow_other,
+      other_label: record.other_label,
+      multi_select: record.multi_select,
+      type: record.type,
+      id: 'q-1',
+    }];
+  let lines = 2;
+  if (record.header) lines += lineCount(record.header);
+  for (const question of questions) {
+    lines += 2 + lineCount(question.question);
+    if (question.header && question.header !== record.header) lines += lineCount(question.header);
+    for (const option of question.options) {
+      lines += 1 + lineCount(option.description);
+    }
+    if (question.allow_other) lines += 1;
+    lines += 2;
+  }
+  if (questions.length > 1) lines += 3;
+  return lines;
+}
+
+export function computeAdaptiveQuestionPaneHeight(availableHeight: number, estimatedContentLines: number): number {
+  const safeAvailable = Number.isFinite(availableHeight) && availableHeight > 0 ? Math.floor(availableHeight) : 40;
+  const maxHeight = Math.max(1, safeAvailable - 2);
+  const minLarge = Math.min(Math.max(18, Math.floor(safeAvailable * 0.60)), maxHeight);
+  const requested = Number.isFinite(estimatedContentLines) && estimatedContentLines > 0 ? Math.ceil(estimatedContentLines) : 24;
+  return Math.min(Math.max(Math.max(requested, minLarge), Math.min(8, maxHeight)), maxHeight);
+}
+
+function readQuestionRecordForSizing(recordPath: string): QuestionRecord | null {
+  return readJsonFileIfExists(recordPath) as QuestionRecord | null;
+}
+
+function resolveAvailablePaneHeight(
+  execTmux: ExecTmuxSync,
+  target: string | undefined,
+): number {
+  const format = '#{pane_height}';
+  const attempts = target ? [['display-message', '-p', '-t', target, format], ['display-message', '-p', format]] : [['display-message', '-p', format]];
+  for (const args of attempts) {
+    try {
+      const parsed = Number.parseInt(execTmux(args).trim(), 10);
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    } catch {
+      // Try the next source, then fall back.
+    }
+  }
+  return 40;
 }
 
 function resolveQuestionUiProcessArgs(
@@ -243,8 +307,9 @@ function resolveReturnTarget(options: {
 function isCurrentTmuxSessionAttached(
   execTmux: ExecTmuxSync = defaultExecTmux,
   env: NodeJS.ProcessEnv = process.env,
+  targetPane?: string,
 ): boolean {
-  const paneTarget = safeString(env.TMUX_PANE).trim();
+  const paneTarget = targetPane ?? safeString(env.TMUX_PANE).trim();
   const targetArgs = isPaneId(paneTarget) ? ['-t', paneTarget] : [];
   try {
     const attached = execTmux(['display-message', '-p', ...targetArgs, '#{session_attached}']).trim();
@@ -311,6 +376,29 @@ export function isQuestionRendererAlive(
   return true;
 }
 
+export function closeQuestionRenderer(
+  renderer: QuestionRendererState | undefined,
+  execTmux: ExecTmuxSync = defaultExecTmux,
+): boolean {
+  if (!renderer) return false;
+  try {
+    if (renderer.renderer === 'tmux-pane' && isPaneId(renderer.target)) {
+      execTmux(['kill-pane', '-t', renderer.target]);
+      return true;
+    }
+    if (renderer.renderer === 'tmux-session' && renderer.target !== 'test-noop-renderer' && safeString(renderer.target).trim()) {
+      execTmux(['kill-session', '-t', renderer.target]);
+      return true;
+    }
+    if (renderer.renderer === 'windows-console') {
+      return false;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
 export function formatQuestionAnswerForInjection(answer: QuestionAnswer): string {
   const prefix = '[omx question answered]';
   if (answer.kind === 'other') {
@@ -321,6 +409,17 @@ export function formatQuestionAnswerForInjection(answer: QuestionAnswer): string
     return sanitizeReplyInput(`${prefix} ${raw}`);
   }
   return sanitizeReplyInput(`${prefix} ${String(answer.value)}`);
+}
+
+export function formatQuestionAnswersForInjection(answers: Array<{ question_id: string; answer: QuestionAnswer }>): string {
+  const prefix = '[omx question answered]';
+  const body = answers
+    .map((entry) => {
+      const value = Array.isArray(entry.answer.value) ? entry.answer.value.join(', ') : String(entry.answer.value);
+      return `${entry.question_id}: ${value}`;
+    })
+    .join('; ');
+  return sanitizeReplyInput(`${prefix} ${body}`);
 }
 
 export function injectQuestionAnswerToPane(
@@ -341,6 +440,99 @@ export function injectQuestionAnswerToPane(
     sleepImpl(index === 0 ? QUESTION_TEXT_SETTLE_MS : QUESTION_SUBMIT_REPEAT_DELAY_MS);
   }
   return true;
+}
+
+export function injectQuestionAnswersToPane(
+  paneId: string,
+  answers: Array<{ question_id: string; answer: QuestionAnswer }>,
+  execTmux: ExecTmuxSync = defaultExecTmux,
+  sleepImpl: SleepSync = sleepSync,
+): boolean {
+  if (!isPaneId(paneId) || answers.length === 0) return false;
+  if (answers.length === 1) return injectQuestionAnswerToPane(paneId, answers[0]!.answer, execTmux, sleepImpl);
+  const text = formatQuestionAnswersForInjection(answers);
+  if (!text) return false;
+
+  const argvs = buildSendPaneArgvs(paneId, text, true);
+  for (const [index, argv] of argvs.entries()) {
+    execTmux(argv);
+    const hasNextArgv = index < argvs.length - 1;
+    if (!hasNextArgv) continue;
+    sleepImpl(index === 0 ? QUESTION_TEXT_SETTLE_MS : QUESTION_SUBMIT_REPEAT_DELAY_MS);
+  }
+  return true;
+}
+
+
+export interface LiveQuestionRecord {
+  recordPath: string;
+  record: QuestionRecord;
+}
+
+function getQuestionStateDirForRenderer(cwd: string, sessionId?: string): string {
+  return join(getStateDir(cwd, sessionId), 'questions');
+}
+
+function isQuestionRecord(value: unknown): value is QuestionRecord {
+  return Boolean(
+    value
+      && typeof value === 'object'
+      && (value as { kind?: unknown }).kind === 'omx.question/v1'
+      && typeof (value as { question_id?: unknown }).question_id === 'string',
+  );
+}
+
+function writeQuestionRecordSync(recordPath: string, record: QuestionRecord): void {
+  const tempPath = `${recordPath}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(tempPath, `${JSON.stringify(record, null, 2)}\n`, 'utf-8');
+  renameSync(tempPath, recordPath);
+}
+
+export function findLiveQuestionsForSession(
+  cwd: string,
+  sessionId: string | undefined,
+  execTmux: ExecTmuxSync = defaultExecTmux,
+  options: { excludeRecordPath?: string } = {},
+): LiveQuestionRecord[] {
+  const questionsDir = getQuestionStateDirForRenderer(cwd, sessionId);
+  if (!existsSync(questionsDir)) return [];
+  const live: LiveQuestionRecord[] = [];
+  const excludeRecordPath = options.excludeRecordPath;
+  for (const entry of readdirSync(questionsDir, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+    const recordPath = join(questionsDir, entry.name);
+    if (excludeRecordPath && recordPath === excludeRecordPath) continue;
+    const record = readJsonFileIfExists(recordPath);
+    if (!isQuestionRecord(record)) continue;
+    if (record.status !== 'prompting') continue;
+    if (!isQuestionRendererAlive(record.renderer, execTmux)) continue;
+    live.push({ recordPath, record });
+  }
+  return live.sort((left, right) => left.record.created_at.localeCompare(right.record.created_at));
+}
+
+export function supersedeLiveQuestionsForSession(
+  cwd: string,
+  sessionId: string | undefined,
+  execTmux: ExecTmuxSync = defaultExecTmux,
+  options: { excludeRecordPath?: string; nowIso?: string } = {},
+): LiveQuestionRecord[] {
+  const live = findLiveQuestionsForSession(cwd, sessionId, execTmux, options);
+  const nowIso = options.nowIso ?? new Date().toISOString();
+  for (const item of live) {
+    writeQuestionRecordSync(item.recordPath, {
+      ...item.record,
+      status: 'superseded',
+      updated_at: nowIso,
+      error: {
+        code: 'question_superseded',
+        message: 'Question was superseded by a newer omx question launch for the same session.',
+        at: nowIso,
+      },
+    });
+    closeQuestionRenderer(item.record.renderer, execTmux);
+  }
+  return live;
 }
 
 export function launchQuestionRenderer(
@@ -384,20 +576,32 @@ export function launchQuestionRenderer(
   });
 
   if (strategy === 'inside-tmux') {
-    const splitTarget = returnTarget && !safeString(env.TMUX).trim()
-      ? ['-t', returnTarget]
-      : [];
-    if (splitTarget.length === 0 && !isCurrentTmuxSessionAttached(execTmux, env)) {
+    const splitTarget = returnTarget ? ['-t', returnTarget] : [];
+    const attachedCheckTarget = safeString(env.TMUX).trim()
+      ? returnTarget || safeString(env.TMUX_PANE).trim() || undefined
+      : undefined;
+    if (safeString(env.TMUX).trim() && !isCurrentTmuxSessionAttached(execTmux, env, attachedCheckTarget)) {
       throw new Error(
         'omx question cannot open a visible renderer because this tmux session has no attached client. Run omx question from an attached tmux pane.',
       );
     }
 
+    supersedeLiveQuestionsForSession(options.cwd, options.sessionId, execTmux, {
+      excludeRecordPath: options.recordPath,
+      nowIso: launchedAt,
+    });
+
+    const sizingTarget = returnTarget || safeString(env.TMUX_PANE).trim() || undefined;
+    const availableHeight = resolveAvailablePaneHeight(execTmux, sizingTarget);
+    const requestedHeight = computeAdaptiveQuestionPaneHeight(
+      availableHeight,
+      estimateQuestionContentLines(readQuestionRecordForSizing(options.recordPath)),
+    );
     const rawPane = execTmux([
       'split-window',
       '-v',
       '-l',
-      '12',
+      String(requestedHeight),
       ...splitTarget,
       '-P',
       '-F',
@@ -452,6 +656,10 @@ export function launchQuestionRenderer(
   }
 
   if (strategy === 'detached-tmux') {
+    supersedeLiveQuestionsForSession(options.cwd, options.sessionId, execTmux, {
+      excludeRecordPath: options.recordPath,
+      nowIso: launchedAt,
+    });
     const baseName = basename(options.recordPath, '.json').replace(/[^A-Za-z0-9_-]+/g, '-').slice(0, 32) || 'question';
     const sessionName = `omx-question-${baseName}`;
     const output = execTmux([

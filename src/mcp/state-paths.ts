@@ -1,13 +1,19 @@
 import { delimiter, isAbsolute, join, relative, resolve as resolvePath } from 'path';
-import { existsSync } from 'fs';
-import { readdir } from 'fs/promises';
-import { readUsableSessionState } from '../hooks/session.js';
+import { existsSync, realpathSync } from 'fs';
+import { readFile, readdir } from 'fs/promises';
+import {
+  isSessionStateUsable,
+  readUsableSessionState,
+  type SessionState,
+} from '../hooks/session.js';
 
 export const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 export const STATE_MODE_SEGMENT_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const STATE_FILE_SUFFIX = '-state.json';
 const STATE_FILE_NAME_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
 const WORKDIR_ALLOWLIST_ENV = 'OMX_MCP_WORKDIR_ROOTS';
+const OMX_ROOT_ENV = 'OMX_ROOT';
+const OMX_STATE_ROOT_ENV = 'OMX_STATE_ROOT';
 
 export type StateFileScope = 'root' | 'session';
 
@@ -97,8 +103,7 @@ export function resolveWorkingDirectoryForState(workingDirectory?: string): stri
   }
   if (!raw) {
     const cwd = resolvePath(process.cwd());
-    enforceWorkingDirectoryPolicy(cwd);
-    return cwd;
+    return enforceWorkingDirectoryPolicy(cwd);
   }
 
   let normalized = raw;
@@ -120,8 +125,32 @@ export function resolveWorkingDirectoryForState(workingDirectory?: string): stri
   }
 
   const resolved = resolvePath(normalized);
-  enforceWorkingDirectoryPolicy(resolved);
-  return resolved;
+  return enforceWorkingDirectoryPolicy(resolved);
+}
+
+function canonicalizeExistingPath(path: string): string {
+  try {
+    return realpathSync.native(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+
+  let current = path;
+  const suffixes: string[] = [];
+  while (true) {
+    const parent = resolvePath(current, '..');
+    if (parent === current) break;
+    suffixes.unshift(current.substring(parent.length).replace(/^[\\/]+/, ''));
+    current = parent;
+    try {
+      const realParent = realpathSync.native(current);
+      return suffixes.reduce((acc, segment) => resolvePath(acc, segment), realParent);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+
+  return path;
 }
 
 function parseAllowedWorkingDirectoryRoots(): string[] {
@@ -136,7 +165,12 @@ function parseAllowedWorkingDirectoryRoots(): string[] {
       if (part.includes('\0')) {
         throw new Error(`${WORKDIR_ALLOWLIST_ENV} contains an invalid root with a NUL byte`);
       }
-      return resolvePath(part);
+      const resolvedRoot = resolvePath(part);
+      const realRoot = canonicalizeExistingPath(resolvedRoot);
+      if (realRoot !== resolvedRoot) {
+        throw new Error(`${WORKDIR_ALLOWLIST_ENV} root "${resolvedRoot}" resolves through a symlink to "${realRoot}"`);
+      }
+      return realRoot;
     });
 
   return [...new Set(roots)];
@@ -147,24 +181,35 @@ function isWithinRoot(path: string, root: string): boolean {
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
 }
 
-function enforceWorkingDirectoryPolicy(resolvedWorkingDirectory: string): void {
+function enforceWorkingDirectoryPolicy(resolvedWorkingDirectory: string): string {
   const roots = parseAllowedWorkingDirectoryRoots();
-  if (roots.length === 0) return;
+  if (roots.length === 0) return resolvedWorkingDirectory;
 
-  const allowed = roots.some((root) => isWithinRoot(resolvedWorkingDirectory, root));
+  const canonicalWorkingDirectory = canonicalizeExistingPath(resolvedWorkingDirectory);
+  const allowed = roots.some((root) => isWithinRoot(canonicalWorkingDirectory, root));
   if (!allowed) {
     throw new Error(
-      `workingDirectory "${resolvedWorkingDirectory}" is outside allowed roots (${WORKDIR_ALLOWLIST_ENV})`,
+      `workingDirectory "${canonicalWorkingDirectory}" is outside allowed roots (${WORKDIR_ALLOWLIST_ENV})`,
     );
   }
+  return canonicalWorkingDirectory;
 }
 
 export function getBaseStateDir(workingDirectory?: string): string {
-  if ((workingDirectory == null || workingDirectory === '') && typeof process.env.OMX_TEAM_STATE_ROOT === 'string' && process.env.OMX_TEAM_STATE_ROOT.trim() !== '') {
+  const teamStateRootOverride = process.env.OMX_TEAM_STATE_ROOT?.trim();
+  if (typeof teamStateRootOverride === 'string' && teamStateRootOverride !== '') {
     try {
-      return resolveWorkingDirectoryForState(process.env.OMX_TEAM_STATE_ROOT.trim());
+      return resolveWorkingDirectoryForState(teamStateRootOverride);
     } catch {}
   }
+
+  const omxRootOverride = process.env[OMX_ROOT_ENV]?.trim() || process.env[OMX_STATE_ROOT_ENV]?.trim();
+  if (typeof omxRootOverride === 'string' && omxRootOverride !== '') {
+    try {
+      return join(resolveWorkingDirectoryForState(omxRootOverride), '.omx', 'state');
+    } catch {}
+  }
+
   return join(resolveWorkingDirectoryForState(workingDirectory), '.omx', 'state');
 }
 
@@ -200,12 +245,37 @@ function readSessionIdFromEnvironment(env: NodeJS.ProcessEnv = process.env): str
   return undefined;
 }
 
+async function readUsableSessionStateFromBaseStateDir(
+  cwd: string,
+  baseStateDir = getBaseStateDir(cwd),
+): Promise<SessionState | null> {
+  const sessionPath = join(baseStateDir, 'session.json');
+  if (!existsSync(sessionPath)) return null;
+
+  try {
+    const content = await readFile(sessionPath, 'utf-8');
+    const state = JSON.parse(content) as SessionState;
+    return isSessionStateUsable(state, cwd) ? state : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function readCurrentSessionId(workingDirectory?: string): Promise<string | undefined> {
   const cwd = resolveWorkingDirectoryForState(workingDirectory);
+  const baseStateDir = getBaseStateDir(cwd);
   const envSessionId = readSessionIdFromEnvironment();
   if (envSessionId) {
     const envScopedDir = getStateDir(cwd, envSessionId);
     if (existsSync(envScopedDir)) return envSessionId;
+  }
+
+  const baseSession = await readUsableSessionStateFromBaseStateDir(cwd, baseStateDir);
+  if (baseSession) return baseSession.session_id;
+
+  const localStateDir = join(cwd, '.omx', 'state');
+  if (resolvePath(baseStateDir) !== resolvePath(localStateDir)) {
+    return undefined;
   }
 
   return (await readUsableSessionState(cwd))?.session_id;
@@ -244,6 +314,11 @@ export async function resolveStateScope(
  * - explicit session_id => session path only
  * - implicit current session => session path first, root as compatibility fallback
  * - no session => root path only
+ *
+ * This is a compatibility read surface. Do not use it for active-mode
+ * decisions that drive Stop hooks or runtime continuation; use
+ * getAuthoritativeActiveStateDirs instead so stale root state cannot
+ * reactivate an explicitly session-scoped turn.
  */
 export async function getReadScopedStateDirs(
   workingDirectory?: string,
@@ -256,6 +331,34 @@ export async function getReadScopedStateDirs(
     return [scope.stateDir, getBaseStateDir(workingDirectory)];
   }
   return [scope.stateDir, getBaseStateDir(workingDirectory)];
+}
+
+/**
+ * Active-decision scope precedence:
+ * - explicit/current session => that session path only, even if it is missing
+ * - no session => root path only
+ *
+ * Stop hooks, list-active, and other continuation gates should use this path
+ * instead of compatibility reads. A missing session directory means no active
+ * state for that session; root fallback remains available only to explicit
+ * read/status compatibility surfaces.
+ */
+export async function getAuthoritativeActiveStateDirs(
+  workingDirectory?: string,
+  explicitSessionId?: string,
+): Promise<string[]> {
+  const scope = await resolveStateScope(workingDirectory, explicitSessionId);
+  return [scope.stateDir];
+}
+
+export async function getAuthoritativeActiveStatePaths(
+  mode: string,
+  workingDirectory?: string,
+  explicitSessionId?: string,
+): Promise<string[]> {
+  const dirs = await getAuthoritativeActiveStateDirs(workingDirectory, explicitSessionId);
+  const fileName = getStateFilename(mode);
+  return dirs.map((dir) => join(dir, fileName));
 }
 
 export async function getReadScopedStatePaths(

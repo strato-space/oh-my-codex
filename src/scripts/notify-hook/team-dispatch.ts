@@ -1,6 +1,6 @@
 // @ts-nocheck
 import { appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'fs/promises';
-import { existsSync } from 'fs';
+import { appendFileSync, existsSync, mkdirSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'node:url';
@@ -27,7 +27,7 @@ import {
  * owned path.
  * Disable entirely with OMX_RUNTIME_BRIDGE=0.
  */
-function runtimeExec(command, stateDir) {
+function runtimeExec(command, stateDir, team) {
   if (process.env.OMX_RUNTIME_BRIDGE === '0') return;
   try {
     const binaryPath = resolveRuntimeBinaryPath();
@@ -36,8 +36,79 @@ function runtimeExec(command, stateDir) {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
     });
-  } catch {
+  } catch (error) {
+    recordBridgeFallback({
+      stateDir,
+      team,
+      operation: 'runtimeExec',
+      fallbackTarget: 'js_state_mutation',
+      command: safeString(command?.command).trim() || 'unknown',
+      requestId: safeString(command?.request_id).trim() || undefined,
+      messageId: safeString(command?.message_id).trim() || undefined,
+      reason: bridgeErrorReason(error),
+    });
     // non-fatal: JS path is the fallback
+  }
+}
+
+function bridgeErrorReason(error) {
+  const err = error || {};
+  const stderr = safeString(err.stderr).trim();
+  if (stderr) return stderr.slice(0, 500);
+  const message = safeString(err.message).trim();
+  if (message) return message.slice(0, 500);
+  return 'unknown_bridge_error';
+}
+
+function bridgeFallbackLogPath(stateDir) {
+  return join(dirname(stateDir), 'logs', `team-dispatch-${new Date().toISOString().slice(0, 10)}.jsonl`);
+}
+
+function recordBridgeFallback({
+  stateDir,
+  team,
+  operation,
+  fallbackTarget,
+  command,
+  requestId,
+  messageId,
+  reason,
+}) {
+  const event = {
+    timestamp: new Date().toISOString(),
+    type: 'bridge_fallback',
+    source: 'notify-hook.team-dispatch',
+    fallback: true,
+    counter: 'team_dispatch_bridge_fallback_total',
+    bridge_operation: operation,
+    fallback_target: fallbackTarget,
+    team: safeString(team).trim() || null,
+    command: safeString(command).trim() || null,
+    request_id: safeString(requestId).trim() || null,
+    message_id: safeString(messageId).trim() || null,
+    reason: safeString(reason).trim() || 'unknown_bridge_fallback',
+  };
+  try {
+    const logPath = bridgeFallbackLogPath(stateDir);
+    mkdirSync(dirname(logPath), { recursive: true });
+    appendFileSync(logPath, `${JSON.stringify(event)}\n`);
+  } catch {
+    // best effort observability only
+  }
+  try {
+    appendTeamDeliveryLog(join(dirname(stateDir), 'logs'), {
+      event: 'bridge_fallback',
+      ...event,
+    }).catch(() => {});
+  } catch {
+    // best effort observability only
+  }
+  try {
+    process.emitWarning(`[omx] team-dispatch bridge fallback: ${event.bridge_operation} -> ${event.fallback_target}: ${event.reason}`, {
+      code: 'OMX_TEAM_DISPATCH_BRIDGE_FALLBACK',
+    });
+  } catch {
+    // best effort observability only
   }
 }
 
@@ -50,8 +121,29 @@ function readJson(path, fallback) {
 async function readBridgeDispatchRequests(stateDir, teamName) {
   const candidate = join(stateDir, 'dispatch.json');
   if (!existsSync(candidate)) return null;
-  const parsed = await readJson(candidate, null);
-  if (!parsed || !Array.isArray(parsed.records)) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(await readFile(candidate, 'utf8'));
+  } catch (error) {
+    recordBridgeFallback({
+      stateDir,
+      team: teamName,
+      operation: 'readBridgeDispatchRequests',
+      fallbackTarget: 'legacy_dispatch_requests',
+      reason: `parse_failed:${bridgeErrorReason(error)}`,
+    });
+    return null;
+  }
+  if (!parsed || !Array.isArray(parsed.records)) {
+    recordBridgeFallback({
+      stateDir,
+      team: teamName,
+      operation: 'readBridgeDispatchRequests',
+      fallbackTarget: 'legacy_dispatch_requests',
+      reason: 'invalid_dispatch_compat_schema',
+    });
+    return null;
+  }
   return parsed.records
     .map((record) => {
       if (!record || typeof record !== 'object') return null;
@@ -501,7 +593,7 @@ async function finalizeClaimedDispatchRequest({
         request.status = 'failed';
         request.failed_at = nowIso;
         request.last_reason = 'unconfirmed_after_max_retries';
-        runtimeExec({ command: 'MarkFailed', request_id: request.request_id, reason: 'unconfirmed_after_max_retries' }, stateDir);
+        runtimeExec({ command: 'MarkFailed', request_id: request.request_id, reason: 'unconfirmed_after_max_retries' }, stateDir, teamName);
         summary.processed += 1;
         summary.failed += 1;
         mutated = true;
@@ -538,9 +630,9 @@ async function finalizeClaimedDispatchRequest({
         request.status = 'notified';
         request.notified_at = nowIso;
         request.last_reason = result.reason;
-        runtimeExec({ command: 'MarkNotified', request_id: request.request_id, channel: 'tmux' }, stateDir);
+        runtimeExec({ command: 'MarkNotified', request_id: request.request_id, channel: 'tmux' }, stateDir, teamName);
         if (request.kind === 'mailbox' && request.message_id) {
-          runtimeExec({ command: 'MarkMailboxNotified', message_id: request.message_id }, stateDir);
+          runtimeExec({ command: 'MarkMailboxNotified', message_id: request.message_id }, stateDir, teamName);
           if (usingLegacyRequests) {
             await updateMailboxNotified(stateDir, teamName, request.to_worker, request.message_id).catch(() => {});
           }
@@ -571,7 +663,7 @@ async function finalizeClaimedDispatchRequest({
       request.status = 'failed';
       request.failed_at = nowIso;
       request.last_reason = result.reason;
-      runtimeExec({ command: 'MarkFailed', request_id: request.request_id, reason: result.reason }, stateDir);
+      runtimeExec({ command: 'MarkFailed', request_id: request.request_id, reason: result.reason }, stateDir, teamName);
       summary.processed += 1;
       summary.failed += 1;
       mutated = true;
@@ -634,12 +726,14 @@ function resolveWorkerCliForRequest(request, config) {
 
 function capturedPaneContainsTrigger(captured, trigger) {
   if (!captured || !trigger) return false;
-  return normalizeTmuxCapture(captured).includes(normalizeTmuxCapture(trigger));
+  const normalizeForDraftMatch = (value) => normalizeTmuxCapture(value).replace(/-\s+/g, '-');
+  return normalizeForDraftMatch(captured).includes(normalizeForDraftMatch(trigger));
 }
 
 function capturedPaneContainsTriggerNearTail(captured, trigger, nonEmptyTailLines = 24) {
   if (!captured || !trigger) return false;
-  const normalizedTrigger = normalizeTmuxCapture(trigger);
+  const normalizeForDraftMatch = (value) => normalizeTmuxCapture(value).replace(/-\s+/g, '-');
+  const normalizedTrigger = normalizeForDraftMatch(trigger);
   if (!normalizedTrigger) return false;
   const lines = safeString(captured)
     .split('\n')
@@ -647,7 +741,13 @@ function capturedPaneContainsTriggerNearTail(captured, trigger, nonEmptyTailLine
     .filter((line) => line.length > 0);
   if (lines.length === 0) return false;
   const tail = lines.slice(-Math.max(1, nonEmptyTailLines)).join(' ');
-  return normalizeTmuxCapture(tail).includes(normalizedTrigger);
+  return normalizeForDraftMatch(tail).includes(normalizedTrigger);
+}
+
+function buildJoinedCapturePaneArgv(paneTarget, tailLines = 80) {
+  // Join wrapped visual lines so long path-like trigger text split by tmux
+  // remains comparable with the original trigger.
+  return ['capture-pane', '-J', '-t', paneTarget, '-p', '-S', `-${tailLines}`];
 }
 
 const INJECT_VERIFY_DELAY_MS = 250;
@@ -699,7 +799,7 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
   if (attemptCountAtStart >= 1) {
     try {
       // Narrow capture (8 lines) to scope check to input area, not scrollback output
-      const preCapture = await runProcess('tmux', buildCapturePaneArgv(resolution.paneTarget, 8), 2000);
+      const preCapture = await runProcess('tmux', buildJoinedCapturePaneArgv(resolution.paneTarget, 8), 2000);
       preCaptureHasTrigger = capturedPaneContainsTrigger(preCapture.stdout, request.trigger_message);
     } catch {
       preCaptureHasTrigger = false;
@@ -722,6 +822,7 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
     prompt: request.trigger_message,
     submitKeyPresses,
     typePrompt: shouldTypePrompt,
+    queueFirstSubmit: leaderTargeted,
   });
   if (!sendResult.ok) {
     return {
@@ -738,8 +839,8 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
   // Post-injection verification: confirm the trigger text was consumed.
   // Fixes #391: without this, dispatch marks 'notified' even when the worker
   // pane is sitting on an unsent draft (C-m was not effectively applied).
-  const verifyNarrowArgv = buildCapturePaneArgv(resolution.paneTarget, 8);
-  const verifyWideArgv = buildCapturePaneArgv(resolution.paneTarget);
+  const verifyNarrowArgv = buildJoinedCapturePaneArgv(resolution.paneTarget, 8);
+  const verifyWideArgv = buildJoinedCapturePaneArgv(resolution.paneTarget);
   for (let round = 0; round < INJECT_VERIFY_ROUNDS; round++) {
     await new Promise((r) => setTimeout(r, INJECT_VERIFY_DELAY_MS));
     try {
@@ -750,9 +851,22 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
       // full-scrollback false positives.
       const narrowCap = await runProcess('tmux', verifyNarrowArgv, 2000);
       const wideCap = await runProcess('tmux', verifyWideArgv, 2000);
+      const triggerInNarrow = capturedPaneContainsTrigger(narrowCap.stdout, request.trigger_message);
+      const triggerNearTail = capturedPaneContainsTriggerNearTail(wideCap.stdout, request.trigger_message);
+      if (triggerInNarrow || triggerNearTail) {
+        // Draft is still visible, so C-m has not actually submitted it yet.
+        // Do not let transient spinner/active-task text mask an unsent draft.
+        await sendPaneInput({
+          paneTarget: resolution.paneTarget,
+          prompt: request.trigger_message,
+          submitKeyPresses,
+          typePrompt: false,
+        }).catch(() => {});
+        continue;
+      }
       // Worker is actively processing (mirrors sync path tmux-session.ts:1292-1294)
       if (paneHasActiveTask(wideCap.stdout)) {
-        runtimeExec({ command: 'MarkDelivered', request_id: request.request_id }, stateDir);
+        runtimeExec({ command: 'MarkDelivered', request_id: request.request_id }, stateDir, request.team_name);
         return {
           ok: true,
           reason: 'tmux_send_keys_confirmed_active_task',
@@ -763,17 +877,17 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
           tmux_injection_attempted: true,
         };
       }
-      // Do not declare success while a *worker* pane is still bootstrapping / not
-      // input-ready. Otherwise a pre-ready send can be marked "confirmed" and later
-      // appear as a stuck unsent draft once the UI finishes loading.
-      // Keep leader-fixed behavior unchanged to avoid regressing leader notification flow.
-      if (request.to_worker !== 'leader-fixed' && !paneLooksReady(wideCap.stdout)) {
+      // Do not declare success while a pane is not input-ready. Otherwise a
+      // pre-ready send can be marked "confirmed" and later appear as a stuck
+      // unsent draft once the UI finishes loading. This includes leader-fixed:
+      // its Codex UI can show "tab to queue message" while busy, and marking
+      // delivered before queue/consumption confirmation loses the orchestration
+      // nudge until a human presses Tab manually.
+      if (!paneLooksReady(wideCap.stdout)) {
         continue;
       }
-      const triggerInNarrow = capturedPaneContainsTrigger(narrowCap.stdout, request.trigger_message);
-      const triggerNearTail = capturedPaneContainsTriggerNearTail(wideCap.stdout, request.trigger_message);
       if (!triggerInNarrow && !triggerNearTail) {
-        runtimeExec({ command: 'MarkDelivered', request_id: request.request_id }, stateDir);
+        runtimeExec({ command: 'MarkDelivered', request_id: request.request_id }, stateDir, request.team_name);
         return {
           ok: true,
           reason: 'tmux_send_keys_confirmed',
@@ -793,6 +907,7 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
       prompt: request.trigger_message,
       submitKeyPresses,
       typePrompt: false,
+      queueFirstSubmit: leaderTargeted,
     }).catch(() => {});
   }
 

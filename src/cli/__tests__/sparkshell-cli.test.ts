@@ -14,6 +14,7 @@ import {
   packagedSparkShellBinaryCandidatePaths,
   parseSparkShellFallbackInvocation,
   repoLocalSparkShellBinaryPath,
+  resolveFallbackShellArgv,
   resolveSparkShellBinaryPath,
   resolveSparkShellBinaryPathWithHydration,
   runSparkShellBinary,
@@ -399,6 +400,44 @@ describe('parseSparkShellFallbackInvocation', () => {
     );
   });
 
+  it('translates explicit shell fallback through sh -lc', () => {
+    assert.deepEqual(
+      parseSparkShellFallbackInvocation(['--shell', 'printf ok']),
+      { kind: 'command', argv: ['sh', '-lc', 'printf ok'] },
+    );
+  });
+
+  it('translates explicit shell fallback through pwsh on Windows when available', () => {
+    assert.deepEqual(
+      parseSparkShellFallbackInvocation(['--shell', 'Write-Output ok'], {
+        platform: 'win32',
+        commandExists: (command) => command === 'pwsh',
+      }),
+      { kind: 'command', argv: ['pwsh', '-NoLogo', '-NoProfile', '-Command', 'Write-Output ok'] },
+    );
+  });
+
+  it('falls back from pwsh to powershell.exe on Windows', () => {
+    assert.deepEqual(
+      resolveFallbackShellArgv('Write-Output ok', {
+        platform: 'win32',
+        commandExists: (command) => command === 'powershell.exe',
+      }),
+      ['powershell.exe', '-NoLogo', '-NoProfile', '-Command', 'Write-Output ok'],
+    );
+  });
+
+  it('uses minimal cmd fallback for explicit shell fallback on Windows', () => {
+    assert.deepEqual(
+      resolveFallbackShellArgv('echo ok', {
+        platform: 'win32',
+        env: {},
+        commandExists: () => false,
+      }),
+      ['cmd.exe', '/d', '/s', '/c', 'echo ok'],
+    );
+  });
+
   it('matches the shared notification capture-pane argv contract', () => {
     const parsed = parseSparkShellFallbackInvocation(['--tmux-pane', '%12', '--tail-lines', '400']);
     assert.deepEqual(parsed, {
@@ -423,10 +462,10 @@ describe('omx sparkshell', () => {
       if (shouldSkipForSpawnPermissions(result.error)) return;
 
       assert.equal(result.status, 0, result.stderr || result.stdout);
-      assert.match(result.stdout, /omx explore\s+Default read-only exploration entrypoint \(may adaptively use sparkshell backend\)/);
+      assert.match(result.stdout, /omx explore\s+DEPRECATED compatibility command; use normal repo inspection or omx sparkshell/);
       assert.match(result.stdout, /omx sparkshell <command> \[args\.\.\.\]/);
       assert.match(result.stdout, /omx sparkshell --tmux-pane <pane-id> \[--tail-lines <100-1000>\]/);
-      assert.match(result.stdout, /adaptive backend for qualifying read-only explore tasks/i);
+      assert.match(result.stdout, /explicit tmux-pane summarization/i);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -441,6 +480,8 @@ describe('omx sparkshell', () => {
       assert.equal(result.status, 0, result.stderr || result.stdout);
       assert.match(result.stdout, /Usage: omx sparkshell <command> \[args\.\.\.\]/);
       assert.match(result.stdout, /or: omx sparkshell --tmux-pane <pane-id> \[--tail-lines <100-1000>\]/);
+      assert.match(result.stdout, /OMX_SPARKSHELL_BIN overrides the native binary/);
+      assert.match(result.stdout, /OMX_SPARKSHELL_MODEL_INSTRUCTIONS_FILE overrides packaged summary instructions/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

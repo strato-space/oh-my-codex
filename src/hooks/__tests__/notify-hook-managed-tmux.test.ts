@@ -124,6 +124,63 @@ describe('notify-hook managed tmux windows fallback', () => {
     }
   });
 
+  it('uses authoritative tmux session metadata before recomputing branch-based names', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-managed-tmux-authoritative-'));
+    try {
+      const sessionId = 'omx-authoritative-session';
+      const tmuxSessionName = 'omx-authoritative-without-git';
+      await writeSessionStart(cwd, sessionId, { tmuxSessionName });
+
+      await withFakeTmux(cwd, `#!/usr/bin/env bash
+if [[ "$1" == "display-message" ]]; then
+  echo "${tmuxSessionName}"
+  exit 0
+fi
+exit 1
+`, async () => {
+        process.env.TMUX = '1';
+        delete process.env.TMUX_PANE;
+        process.env.OMX_TEAM_WORKER = '';
+
+        const result = await resolveManagedSessionContext(cwd, { session_id: sessionId }, { allowTeamWorker: false });
+        assert.equal(result.managed, true);
+        assert.equal(result.reason, 'tmux_session_match');
+        assert.equal(result.expectedTmuxSessionName, tmuxSessionName);
+        assert.equal(result.currentTmuxSessionName, tmuxSessionName);
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when authoritative tmux metadata disagrees with the active tmux session', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-managed-tmux-authoritative-mismatch-'));
+    try {
+      const sessionId = 'omx-authoritative-session';
+      await writeSessionStart(cwd, sessionId, { tmuxSessionName: 'omx-expected-session' });
+
+      await withFakeTmux(cwd, `#!/usr/bin/env bash
+if [[ "$1" == "display-message" ]]; then
+  echo "omx-other-session"
+  exit 0
+fi
+exit 1
+`, async () => {
+        process.env.TMUX = '1';
+        delete process.env.TMUX_PANE;
+        process.env.OMX_TEAM_WORKER = '';
+
+        const result = await resolveManagedSessionContext(cwd, { session_id: sessionId }, { allowTeamWorker: false });
+        assert.equal(result.managed, false);
+        assert.equal(result.reason, 'tmux_session_mismatch');
+        assert.equal(result.expectedTmuxSessionName, 'omx-expected-session');
+        assert.equal(result.currentTmuxSessionName, 'omx-other-session');
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('accepts symlinked cwd aliases for the same managed session', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-managed-tmux-cwd-alias-'));
     const aliasCwd = `${cwd}-alias`;
@@ -189,6 +246,76 @@ exit 1
       });
     } finally {
       await rm(aliasCwd, { recursive: true, force: true });
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('uses pane-scoped instance tags before falling back to session tags', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-managed-tmux-pane-instance-'));
+    try {
+      const sessionId = 'omx-pane-instance-owner';
+      const sharedTmuxSession = 'shared-omx-session';
+      await writeSessionStart(cwd, sessionId, { tmuxSessionName: sharedTmuxSession });
+
+      await withFakeTmux(cwd, `#!/usr/bin/env bash
+set -eu
+cmd="$1"
+shift || true
+if [[ "$cmd" == "display-message" ]]; then
+  target=""
+  format=""
+  while (($#)); do
+    case "$1" in
+      -p) shift ;;
+      -t) target="$2"; shift 2 ;;
+      *) format="$1"; shift ;;
+    esac
+  done
+  if [[ "$target" == "%42" && "$format" == "#S" ]]; then
+    echo "${sharedTmuxSession}"
+    exit 0
+  fi
+  if [[ -z "$target" && "$format" == "#S" ]]; then
+    echo "${sharedTmuxSession}"
+    exit 0
+  fi
+fi
+if [[ "$cmd" == "show-option" ]]; then
+  pane_scope=0
+  target=""
+  option=""
+  while (($#)); do
+    case "$1" in
+      -qv) shift ;;
+      -p) pane_scope=1; shift ;;
+      -t) target="$2"; shift 2 ;;
+      *) option="$1"; shift ;;
+    esac
+  done
+  if [[ "$pane_scope" == "1" && "$target" == "%42" && "$option" == "@omx_pane_instance_id" ]]; then
+    echo "${sessionId}"
+    exit 0
+  fi
+  if [[ "$pane_scope" == "0" && "$target" == "${sharedTmuxSession}" && "$option" == "@omx_instance_id" ]]; then
+    echo "omx-other-pane-owner"
+    exit 0
+  fi
+fi
+echo "unsupported tmux call: $cmd $*" >&2
+exit 1
+`, async () => {
+        process.env.TMUX = '1';
+        process.env.TMUX_PANE = '%42';
+        process.env.OMX_TEAM_WORKER = '';
+
+        const verdict = await verifyManagedPaneTarget('%42', cwd, { session_id: sessionId }, { allowTeamWorker: false });
+        assert.equal(verdict.ok, true);
+        assert.equal(verdict.reason, 'ok');
+        assert.equal(verdict.paneInstanceId, sessionId);
+        assert.equal(verdict.managedContext.reason, 'tmux_pane_instance_match');
+        assert.equal(verdict.managedContext.currentTmuxPaneInstanceId, sessionId);
+      });
+    } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });

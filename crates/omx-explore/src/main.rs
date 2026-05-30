@@ -3,17 +3,38 @@ use std::ffi::OsString;
 use std::fs::{
     canonicalize, create_dir_all, read_to_string, remove_dir_all, remove_file, write, File,
 };
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CODEX_BIN_ENV: &str = "OMX_EXPLORE_CODEX_BIN";
 const HARNESS_ROOT_ENV: &str = "OMX_EXPLORE_ROOT";
+const CODEX_TIMEOUT_MS_ENV: &str = "OMX_EXPLORE_CODEX_TIMEOUT_MS";
+const PROCESS_LIMIT_ENV: &str = "OMX_EXPLORE_PROCESS_LIMIT";
+const CODEX_OUTPUT_LIMIT_BYTES_ENV: &str = "OMX_EXPLORE_CODEX_OUTPUT_LIMIT_BYTES";
 const INTERNAL_DIRECT_WRAPPER_FLAG: &str = "--internal-allowlist-direct";
 const INTERNAL_SHELL_WRAPPER_FLAG: &str = "--internal-allowlist-shell";
 const TEMP_ALLOWLIST_DIR_PREFIX: &str = "omx-explore-allowlist-";
-const SHELL_STARTUP_ENV_VARS: &[&str] = &["BASH_ENV", "ENV", "PROMPT_COMMAND"];
+const DEFAULT_CODEX_TIMEOUT_MS: u64 = 180_000;
+const DEFAULT_PROCESS_LIMIT: usize = 96;
+const DEFAULT_CODEX_OUTPUT_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+const PROCESS_LIMIT_POLL_MS: u64 = 100;
+const PROCESS_TERMINATION_GRACE_MS: u64 = 500;
+const PIPE_READER_READY_GRACE_MS: u64 = 25;
+const PIPE_READER_JOIN_GRACE_MS: u64 = 500;
+const EXPLORE_SUBPROCESS_ENV_VARS_TO_SCRUB: &[&str] = &[
+    "BASH_ENV",
+    "ENV",
+    "PROMPT_COMMAND",
+    "NODE_OPTIONS",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "GREP_OPTIONS",
+    "GREP_COLORS",
+];
 const WINDOWS_UNSUPPORTED_ALLOWLIST_MESSAGE: &str =
     "omx explore built-in harness is not ready on Windows because its allowlist runtime relies on POSIX sh/bash wrappers. Set OMX_EXPLORE_BIN to a compatible custom harness, prefer `omx sparkshell` for shell-native read-only lookups, or run `omx doctor` for readiness details.";
 
@@ -38,10 +59,19 @@ struct AttemptResult {
     output_markdown: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FallbackEvent {
+    from_model: String,
+    to_model: String,
+    exit_code: i32,
+    stderr: String,
+}
+
 #[derive(Debug)]
 struct AllowlistEnvironment {
     bin_dir: PathBuf,
     shell_path: PathBuf,
+    sandbox_bin_dir: Option<PathBuf>,
     _root: TempDirGuard,
 }
 
@@ -110,21 +140,18 @@ where
         return Ok(());
     }
 
-    eprintln!(
-        "[omx explore] spark model `{}` unavailable or failed (exit {}). Falling back to `{}`.",
-        args.spark_model, spark_attempt.status_code, args.fallback_model
-    );
-    if !spark_attempt.stderr.trim().is_empty() {
-        eprintln!(
-            "[omx explore] spark stderr: {}",
-            spark_attempt.stderr.trim()
-        );
-    }
+    let fallback_event = FallbackEvent {
+        from_model: args.spark_model.clone(),
+        to_model: args.fallback_model.clone(),
+        exit_code: spark_attempt.status_code,
+        stderr: spark_attempt.stderr.clone(),
+    };
+    emit_model_fallback_event(&fallback_event);
 
     let fallback_attempt = invoke_codex(&args, &args.fallback_model, &prompt_contract)
         .map_err(|err| format!("fallback attempt failed to launch: {err}"))?;
     if fallback_attempt.status_code == 0 {
-        print_attempt_output(fallback_attempt)?;
+        print_attempt_output_with_fallback(fallback_attempt, &fallback_event)?;
         return Ok(());
     }
 
@@ -139,13 +166,58 @@ where
 }
 
 fn print_attempt_output(attempt: AttemptResult) -> Result<(), String> {
+    print_attempt_output_with_optional_fallback(attempt, None)
+}
+
+fn print_attempt_output_with_fallback(
+    attempt: AttemptResult,
+    fallback: &FallbackEvent,
+) -> Result<(), String> {
+    print_attempt_output_with_optional_fallback(attempt, Some(fallback))
+}
+
+fn print_attempt_output_with_optional_fallback(
+    attempt: AttemptResult,
+    fallback: Option<&FallbackEvent>,
+) -> Result<(), String> {
     if let Some(markdown) = attempt.output_markdown {
+        if let Some(event) = fallback {
+            print!("{}", fallback_output_notice(event));
+            if !markdown.starts_with('\n') {
+                println!();
+            }
+        }
         print!("{}", markdown);
         return Ok(());
     }
     Err(
         "codex completed successfully but did not produce the expected markdown output artifact"
             .to_string(),
+    )
+}
+
+fn emit_model_fallback_event(event: &FallbackEvent) {
+    eprintln!("{}", fallback_attempt_event_message(event));
+    eprintln!(
+        "[omx explore] spark model `{}` unavailable or failed (exit {}). Falling back to `{}`.",
+        event.from_model, event.exit_code, event.to_model
+    );
+    if !event.stderr.trim().is_empty() {
+        eprintln!("[omx explore] spark stderr: {}", event.stderr.trim());
+    }
+}
+
+fn fallback_attempt_event_message(event: &FallbackEvent) -> String {
+    format!(
+        "[omx explore] fallback-attempt=model from=`{}` to=`{}` reason=spark_attempt_failed exit={}. Cost/behavior boundary changed if fallback succeeds; stdout fallback notice is emitted only after successful fallback output.",
+        event.from_model, event.to_model, event.exit_code
+    )
+}
+
+fn fallback_output_notice(event: &FallbackEvent) -> String {
+    format!(
+        "## OMX Explore fallback\n- fallback: model\n- from: `{}`\n- to: `{}`\n- reason: spark attempt failed with exit {}\n- boundary: cost/behavior may differ from the low-cost spark path\n",
+        event.from_model, event.to_model, event.exit_code
     )
 }
 
@@ -243,18 +315,429 @@ fn invoke_codex(args: &Args, model: &str, prompt_contract: &str) -> io::Result<A
         .arg(&output_path)
         .arg(&final_prompt)
         .env(HARNESS_ROOT_ENV, &args.cwd)
-        .env("PATH", &allowlist.bin_dir)
+        .env(
+            "PATH",
+            build_codex_path(&allowlist.bin_dir, allowlist.sandbox_bin_dir.as_deref())
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?,
+        )
         .env("SHELL", &allowlist.shell_path);
     sanitize_explore_subprocess_env(&mut command);
-    let output = command.output()?;
+    let timeout = codex_timeout();
+    let output = run_command_with_timeout(command, timeout)?;
 
     let markdown = read_to_string(&output_path).ok();
     let _ = remove_file(&output_path);
-    Ok(AttemptResult {
-        status_code: output.status.code().unwrap_or(1),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        output_markdown: markdown,
-    })
+    match output {
+        TimedCommandOutput::Completed(output) => Ok(AttemptResult {
+            status_code: output.status.code().unwrap_or(1),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            output_markdown: markdown,
+        }),
+        TimedCommandOutput::TimedOut { stderr } => Ok(AttemptResult {
+            status_code: 124,
+            stderr: format!(
+                "[omx explore] codex exec timed out after {}ms; terminated process tree{}{}",
+                timeout.as_millis(),
+                if stderr.trim().is_empty() {
+                    ""
+                } else {
+                    ". stderr before timeout: "
+                },
+                stderr.trim()
+            ),
+            output_markdown: None,
+        }),
+        TimedCommandOutput::ProcessLimitExceeded {
+            stderr,
+            process_count,
+            process_limit,
+        } => Ok(AttemptResult {
+            status_code: 125,
+            stderr: format!(
+                "[omx explore] codex exec exceeded per-run process limit ({process_count}>{process_limit}); terminated process tree to avoid runaway shell storms{}{}",
+                if stderr.trim().is_empty() {
+                    ""
+                } else {
+                    ". stderr before termination: "
+                },
+                stderr.trim()
+            ),
+            output_markdown: None,
+        }),
+        TimedCommandOutput::OutputLimitExceeded {
+            stderr,
+            output_limit,
+            stream,
+        } => Ok(AttemptResult {
+            status_code: 126,
+            stderr: format!(
+                "[omx explore] codex exec exceeded subprocess {stream} output limit ({output_limit} bytes); terminated process tree to avoid unbounded memory growth{}{}",
+                if stderr.trim().is_empty() {
+                    ""
+                } else {
+                    ". stderr before termination: "
+                },
+                stderr.trim()
+            ),
+            output_markdown: None,
+        }),
+    }
+}
+
+#[derive(Debug)]
+enum TimedCommandOutput {
+    Completed(Output),
+    TimedOut {
+        stderr: String,
+    },
+    ProcessLimitExceeded {
+        stderr: String,
+        process_count: usize,
+        process_limit: usize,
+    },
+    OutputLimitExceeded {
+        stderr: String,
+        output_limit: usize,
+        stream: &'static str,
+    },
+}
+
+fn codex_timeout() -> Duration {
+    let timeout_ms = env::var(CODEX_TIMEOUT_MS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_CODEX_TIMEOUT_MS);
+    Duration::from_millis(timeout_ms)
+}
+
+fn codex_output_limit_bytes() -> usize {
+    env::var(CODEX_OUTPUT_LIMIT_BYTES_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_CODEX_OUTPUT_LIMIT_BYTES)
+}
+
+fn process_limit() -> usize {
+    env::var(PROCESS_LIMIT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PROCESS_LIMIT)
+}
+
+fn run_command_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+) -> io::Result<TimedCommandOutput> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    configure_process_group(&mut command);
+    let mut child = command.spawn()?;
+
+    let output_limit = codex_output_limit_bytes();
+    let mut stdout_reader = spawn_pipe_reader("stdout", child.stdout.take(), output_limit);
+    let mut stderr_reader = spawn_pipe_reader("stderr", child.stderr.take(), output_limit);
+
+    let deadline = Instant::now() + timeout;
+    let process_limit = process_limit();
+    let mut next_process_limit_poll = Instant::now() + Duration::from_millis(PROCESS_LIMIT_POLL_MS);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            // The wrapper may exit while grandchildren keep the process group
+            // alive. Sweep it before collecting pipes so completed harness
+            // runs cannot leave detached shells behind.
+            terminate_child_process_tree(&mut child);
+            let output = collect_completed_output(
+                &mut child,
+                &mut stdout_reader,
+                &mut stderr_reader,
+                Duration::from_millis(PIPE_READER_READY_GRACE_MS),
+                Duration::from_millis(PIPE_READER_JOIN_GRACE_MS),
+            );
+            let (stdout, stderr) = match output {
+                Ok(output) => output,
+                Err(err) if is_output_limit_error(&err) => {
+                    return Ok(TimedCommandOutput::OutputLimitExceeded {
+                        stderr: String::new(),
+                        output_limit,
+                        stream: output_limit_stream(&err),
+                    });
+                }
+                Err(err) => return Err(err),
+            };
+            return Ok(TimedCommandOutput::Completed(Output {
+                status,
+                stdout,
+                stderr,
+            }));
+        }
+
+        if Instant::now() >= deadline {
+            terminate_child_process_tree(&mut child);
+            let _ = child.wait();
+            let reader_timeout = Duration::from_millis(PIPE_READER_JOIN_GRACE_MS);
+            let _ = receive_pipe_reader(&mut stdout_reader, reader_timeout);
+            let stderr =
+                receive_pipe_reader(&mut stderr_reader, reader_timeout).unwrap_or_default();
+            return Ok(TimedCommandOutput::TimedOut {
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            });
+        }
+
+        if Instant::now() >= next_process_limit_poll {
+            next_process_limit_poll = Instant::now() + Duration::from_millis(PROCESS_LIMIT_POLL_MS);
+            if let Some(process_count) = count_process_tree(child.id()) {
+                if process_count > process_limit {
+                    terminate_child_process_tree(&mut child);
+                    let _ = child.wait();
+                    let reader_timeout = Duration::from_millis(PIPE_READER_JOIN_GRACE_MS);
+                    let _ = receive_pipe_reader(&mut stdout_reader, reader_timeout);
+                    let stderr =
+                        receive_pipe_reader(&mut stderr_reader, reader_timeout).unwrap_or_default();
+                    return Ok(TimedCommandOutput::ProcessLimitExceeded {
+                        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                        process_count,
+                        process_limit,
+                    });
+                }
+            }
+        }
+
+        if let Some(stream) = poll_output_limit(&mut stdout_reader, &mut stderr_reader)? {
+            terminate_child_process_tree(&mut child);
+            let _ = child.wait();
+            let reader_timeout = Duration::from_millis(PIPE_READER_JOIN_GRACE_MS);
+            let stderr = if stream == "stderr" {
+                Vec::new()
+            } else {
+                receive_pipe_reader(&mut stderr_reader, reader_timeout).unwrap_or_default()
+            };
+            return Ok(TimedCommandOutput::OutputLimitExceeded {
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                output_limit,
+                stream,
+            });
+        }
+
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn count_process_tree(root_pid: u32) -> Option<usize> {
+    use std::collections::HashMap;
+    let entries = std::fs::read_dir("/proc").ok()?;
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some(close_paren) = stat.rfind(')') else {
+            continue;
+        };
+        let fields: Vec<&str> = stat[close_paren + 2..].split(' ').collect();
+        let Some(ppid) = fields.get(1).and_then(|field| field.parse::<u32>().ok()) else {
+            continue;
+        };
+        children.entry(ppid).or_default().push(pid);
+    }
+    let mut count = 1;
+    let mut stack = children.remove(&root_pid).unwrap_or_default();
+    while let Some(pid) = stack.pop() {
+        count += 1;
+        if let Some(mut nested) = children.remove(&pid) {
+            stack.append(&mut nested);
+        }
+    }
+    Some(count)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn count_process_tree(_root_pid: u32) -> Option<usize> {
+    None
+}
+
+struct PipeReader {
+    receiver: Receiver<io::Result<Vec<u8>>>,
+    cached: Option<io::Result<Vec<u8>>>,
+}
+
+fn spawn_pipe_reader<R: Read + Send + 'static>(
+    stream: &'static str,
+    pipe: Option<R>,
+    output_limit: usize,
+) -> PipeReader {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(read_pipe_bounded(pipe, stream, output_limit));
+    });
+    PipeReader {
+        receiver,
+        cached: None,
+    }
+}
+
+fn read_pipe_bounded<R: Read + Send + 'static>(
+    pipe: Option<R>,
+    stream: &'static str,
+    output_limit: usize,
+) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let Some(pipe) = pipe else {
+        return Ok(bytes);
+    };
+    let mut reader = BufReader::new(pipe);
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            return Ok(bytes);
+        }
+        if bytes.len().saturating_add(read) > output_limit {
+            return Err(output_limit_error(stream, output_limit));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn output_limit_error(stream: &'static str, output_limit: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Other,
+        format!("subprocess {stream} exceeded output limit of {output_limit} bytes"),
+    )
+}
+
+fn is_output_limit_error(err: &io::Error) -> bool {
+    err.to_string().contains("exceeded output limit")
+}
+
+fn output_limit_stream(err: &io::Error) -> &'static str {
+    if err.to_string().contains("stderr") {
+        "stderr"
+    } else {
+        "stdout"
+    }
+}
+
+fn poll_output_limit(
+    stdout_reader: &mut PipeReader,
+    stderr_reader: &mut PipeReader,
+) -> io::Result<Option<&'static str>> {
+    if let Some(stream) = poll_one_output_limit("stdout", stdout_reader)? {
+        return Ok(Some(stream));
+    }
+    poll_one_output_limit("stderr", stderr_reader)
+}
+
+fn poll_one_output_limit(
+    stream: &'static str,
+    reader: &mut PipeReader,
+) -> io::Result<Option<&'static str>> {
+    if reader.cached.is_some() {
+        return Ok(None);
+    }
+    match reader.receiver.try_recv() {
+        Ok(Ok(bytes)) => {
+            reader.cached = Some(Ok(bytes));
+            Ok(None)
+        }
+        Ok(Err(err)) if is_output_limit_error(&err) => Ok(Some(stream)),
+        Ok(Err(err)) => Err(err),
+        Err(TryRecvError::Empty) => Ok(None),
+        Err(TryRecvError::Disconnected) => Err(io::Error::new(
+            io::ErrorKind::Other,
+            "subprocess output reader disconnected",
+        )),
+    }
+}
+
+fn collect_completed_output(
+    child: &mut Child,
+    stdout_reader: &mut PipeReader,
+    stderr_reader: &mut PipeReader,
+    ready_timeout: Duration,
+    cleanup_timeout: Duration,
+) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    let stdout = receive_pipe_reader_if_ready(stdout_reader, ready_timeout)?;
+    let stderr = receive_pipe_reader_if_ready(stderr_reader, ready_timeout)?;
+
+    if stdout.is_none() || stderr.is_none() {
+        terminate_child_process_tree(child);
+    }
+
+    let stdout = match stdout {
+        Some(stdout) => stdout,
+        None => receive_pipe_reader(stdout_reader, cleanup_timeout)?,
+    };
+    let stderr = match stderr {
+        Some(stderr) => stderr,
+        None => receive_pipe_reader(stderr_reader, cleanup_timeout)?,
+    };
+
+    Ok((stdout, stderr))
+}
+
+fn receive_pipe_reader_if_ready(
+    reader: &mut PipeReader,
+    timeout: Duration,
+) -> io::Result<Option<Vec<u8>>> {
+    match receive_pipe_reader(reader, timeout) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == io::ErrorKind::TimedOut => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn receive_pipe_reader(reader: &mut PipeReader, timeout: Duration) -> io::Result<Vec<u8>> {
+    if let Some(result) = reader.cached.take() {
+        return result;
+    }
+    match reader.receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timed out waiting for subprocess output pipe to close",
+        )),
+        Err(RecvTimeoutError::Disconnected) => Err(io::Error::new(
+            io::ErrorKind::Other,
+            "subprocess output reader disconnected",
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_child_process_tree(child: &mut Child) {
+    let pgid = child.id() as libc::pid_t;
+    unsafe {
+        let _ = libc::kill(-pgid, libc::SIGTERM);
+    }
+    thread::sleep(Duration::from_millis(PROCESS_TERMINATION_GRACE_MS));
+    unsafe {
+        let _ = libc::kill(-pgid, libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
+#[cfg(not(unix))]
+fn terminate_child_process_tree(child: &mut Child) {
+    let _ = child.kill();
 }
 
 fn escape_toml_string(value: &str) -> String {
@@ -533,11 +1016,47 @@ fn prepare_allowlist_environment() -> Result<AllowlistEnvironment, String> {
     write_executable(&shell_path, &bash_wrapper)?;
     write_executable(&bin_dir.join("sh"), &sh_wrapper)?;
 
+    let sandbox_bin_dir = prepare_sandbox_dependency_bin(&root.path)?;
+
     Ok(AllowlistEnvironment {
         bin_dir,
         shell_path,
+        sandbox_bin_dir,
         _root: root,
     })
+}
+
+fn build_codex_path(
+    allowlist_bin_dir: &Path,
+    sandbox_bin_dir: Option<&Path>,
+) -> Result<OsString, String> {
+    let mut entries = vec![allowlist_bin_dir.to_path_buf()];
+    if let Some(sandbox_bin_dir) = sandbox_bin_dir {
+        entries.push(sandbox_bin_dir.to_path_buf());
+    }
+    env::join_paths(entries).map_err(|err| format!("failed to construct restricted PATH: {err}"))
+}
+
+fn prepare_sandbox_dependency_bin(root: &Path) -> Result<Option<PathBuf>, String> {
+    let Some(bwrap_path) = resolve_host_command("bwrap") else {
+        return Ok(None);
+    };
+
+    let sandbox_bin_dir = root.join("sandbox-bin");
+    create_dir_all(&sandbox_bin_dir).map_err(|err| {
+        format!(
+            "failed to create sandbox dependency bin dir {}: {err}",
+            sandbox_bin_dir.display()
+        )
+    })?;
+    write_executable(
+        &sandbox_bin_dir.join("bwrap"),
+        &format!(
+            "#!/bin/sh\nexec {} \"$@\"\n",
+            shell_quote(&bwrap_path.display().to_string())
+        ),
+    )?;
+    Ok(Some(sandbox_bin_dir))
 }
 
 fn allowlist_platform_diagnostic(os: &str) -> Option<&'static str> {
@@ -668,9 +1187,16 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn sanitize_explore_subprocess_env(command: &mut Command) {
-    for key in SHELL_STARTUP_ENV_VARS {
+    for key in EXPLORE_SUBPROCESS_ENV_VARS_TO_SCRUB {
         command.env_remove(key);
     }
+}
+
+fn shell_supports_bash_startup_suppression(shell_path: &str) -> bool {
+    Path::new(shell_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "bash")
 }
 
 fn run_internal_direct_wrapper<I>(mut args: I) -> Result<(), String>
@@ -705,17 +1231,22 @@ where
     let forwarded: Vec<String> = args.map(|arg| arg.to_string_lossy().into_owned()).collect();
     let command = validate_shell_invocation(&forwarded)?;
 
-    let mut child = Command::new(&real_shell);
-    if real_shell.ends_with("bash") {
+    let status_code = execute_validated_shell(&real_shell, &command)?;
+    std::process::exit(status_code);
+}
+
+fn execute_validated_shell(real_shell: &str, command: &str) -> Result<i32, String> {
+    let mut child = Command::new(real_shell);
+    if shell_supports_bash_startup_suppression(real_shell) {
         child.arg("--noprofile").arg("--norc");
     }
     sanitize_explore_subprocess_env(&mut child);
     let status = child
-        .arg("-lc")
-        .arg(&command)
+        .arg("-c")
+        .arg(command)
         .status()
         .map_err(|err| format!("failed to execute validated shell command: {err}"))?;
-    std::process::exit(status.code().unwrap_or(1));
+    Ok(status.code().unwrap_or(1))
 }
 
 fn validate_shell_invocation(args: &[String]) -> Result<String, String> {
@@ -991,6 +1522,13 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn process_tree_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
@@ -1290,6 +1828,88 @@ exec node "$basedir/../@openai/codex/bin/codex.js" "$@"
             None => unsafe { env::remove_var("PATH") },
         }
         result
+    }
+
+    #[test]
+    fn build_codex_path_keeps_allowlist_first_and_only_adds_sandbox_bin() {
+        let allowlist_bin = Path::new("/tmp/omx-explore-allowlist/bin");
+        let sandbox_bin = Path::new("/tmp/omx-explore-sandbox-bin");
+
+        let path = build_codex_path(allowlist_bin, Some(sandbox_bin)).expect("restricted path");
+        let entries: Vec<PathBuf> = env::split_paths(&path).collect();
+
+        assert_eq!(
+            entries,
+            vec![allowlist_bin.to_path_buf(), sandbox_bin.to_path_buf()]
+        );
+    }
+
+    #[test]
+    fn build_codex_path_omits_sandbox_bin_when_bwrap_is_absent() {
+        let allowlist_bin = Path::new("/tmp/omx-explore-allowlist/bin");
+
+        let path = build_codex_path(allowlist_bin, None).expect("restricted path");
+        let entries: Vec<PathBuf> = env::split_paths(&path).collect();
+
+        assert_eq!(entries, vec![allowlist_bin.to_path_buf()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_allowlist_environment_adds_controlled_bwrap_without_host_path() {
+        let _guard = env_lock();
+        let mut commands = vec!["bash", "sh"];
+        commands.extend(
+            ALLOWED_DIRECT_COMMANDS
+                .iter()
+                .copied()
+                .filter(|command| *command != "rg"),
+        );
+        let (_root, host_bin) = create_host_bin_with_commands(&commands);
+        let fake_bwrap = host_bin.join("bwrap");
+        write_executable(&fake_bwrap, "#!/bin/sh\nexit 0\n").expect("write fake bwrap");
+
+        let allowlist =
+            with_path(&host_bin, prepare_allowlist_environment).expect("allowlist environment");
+        let sandbox_bin = allowlist
+            .sandbox_bin_dir
+            .as_ref()
+            .expect("sandbox bin when bwrap exists");
+        let path = build_codex_path(&allowlist.bin_dir, allowlist.sandbox_bin_dir.as_deref())
+            .expect("codex path");
+        let entries: Vec<PathBuf> = env::split_paths(&path).collect();
+
+        assert_eq!(
+            entries,
+            vec![allowlist.bin_dir.clone(), sandbox_bin.clone()]
+        );
+        assert!(!entries.contains(&host_bin));
+        let controlled_bwrap =
+            read_to_string(sandbox_bin.join("bwrap")).expect("read controlled bwrap");
+        assert!(controlled_bwrap.contains(&fake_bwrap.display().to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_allowlist_environment_leaves_path_allowlist_only_without_bwrap() {
+        let _guard = env_lock();
+        let mut commands = vec!["bash", "sh"];
+        commands.extend(
+            ALLOWED_DIRECT_COMMANDS
+                .iter()
+                .copied()
+                .filter(|command| *command != "rg"),
+        );
+        let (_root, host_bin) = create_host_bin_with_commands(&commands);
+
+        let allowlist =
+            with_path(&host_bin, prepare_allowlist_environment).expect("allowlist environment");
+        let path = build_codex_path(&allowlist.bin_dir, allowlist.sandbox_bin_dir.as_deref())
+            .expect("codex path");
+        let entries: Vec<PathBuf> = env::split_paths(&path).collect();
+
+        assert!(allowlist.sandbox_bin_dir.is_none());
+        assert_eq!(entries, vec![allowlist.bin_dir]);
     }
 
     #[cfg(unix)]
@@ -1734,6 +2354,69 @@ printf '# Answer\nok\n' > "$output_path"
     }
 
     #[test]
+    fn invoke_codex_scrubs_node_options_before_node_shebang_launch() {
+        let _guard = env_lock();
+        if resolve_host_command("node").is_none() {
+            return;
+        }
+
+        let root = temp_allowlist_dir().expect("temp root");
+        let repo = root.path.join("repo");
+        create_dir_all(&repo).expect("create repo");
+        let prompt_file = root.path.join("prompt.md");
+        write(&prompt_file, "contract").expect("write prompt");
+        let capture_path = root.path.join("node-options.txt");
+        let fake_codex = root.path.join("codex-node-stub");
+        write(
+            &fake_codex,
+            format!(
+                r#"#!/usr/bin/env node
+const fs = require('fs');
+let outputPath = '';
+for (let index = 2; index < process.argv.length; index += 1) {{
+  if (process.argv[index] === '-o') {{
+    outputPath = process.argv[index + 1];
+    index += 1;
+  }}
+}}
+fs.writeFileSync({}, `NODE_OPTIONS=${{process.env.NODE_OPTIONS || ''}}\n`);
+fs.writeFileSync(outputPath, '# Answer\nok\n');
+"#,
+                shell_quote(&capture_path.display().to_string())
+            ),
+        )
+        .expect("write fake codex");
+
+        unsafe {
+            env::set_var(CODEX_BIN_ENV, &fake_codex);
+            env::set_var("NODE_OPTIONS", "--disable-warning=");
+        }
+        let attempt = invoke_codex(
+            &Args {
+                cwd: repo.clone(),
+                prompt: "find tests".to_string(),
+                prompt_file,
+                instructions_file: repo.join("AGENTS.md"),
+                spark_model: "spark-model".to_string(),
+                fallback_model: "fallback-model".to_string(),
+            },
+            "spark-model",
+            "contract",
+        )
+        .expect("invoke codex");
+        unsafe {
+            env::remove_var(CODEX_BIN_ENV);
+            env::remove_var("NODE_OPTIONS");
+        }
+
+        assert_eq!(attempt.status_code, 0);
+        assert_eq!(
+            read_to_string(&capture_path).expect("read capture"),
+            "NODE_OPTIONS=\n"
+        );
+    }
+
+    #[test]
     fn invoke_codex_injects_model_instructions_file_override() {
         let _guard = env_lock();
         let root = temp_allowlist_dir().expect("temp root");
@@ -1834,6 +2517,444 @@ printf '# Answer\nok\n' > "$output_path"
 
         assert!(status.success());
         assert_eq!(read_to_string(&bash_env_log).unwrap_or_default(), "");
+    }
+
+    #[test]
+    fn execute_validated_shell_drops_login_flag_and_startup_env() {
+        let _guard = env_lock();
+        let root = temp_allowlist_dir().expect("temp root");
+        let fake_shell = root.path.join("fake-sh");
+        let argv_log = root.path.join("argv.log");
+        let startup_log = root.path.join("startup.log");
+        let bash_env = root.path.join("bash-env.sh");
+        write(
+            &bash_env,
+            format!(
+                "grep -qsi '^COLOR.*none' /etc/GREP_COLORS || true\nprintf startup >> {}\n",
+                shell_quote(&startup_log.display().to_string())
+            ),
+        )
+        .expect("write fake startup hook");
+        write_executable(
+            &fake_shell,
+            &format!(
+                r#"#!/bin/sh
+printf '%s
+' "$@" > {}
+if [ "${{BASH_ENV:-}}" ]; then
+  . "$BASH_ENV"
+fi
+if [ "$1" = "-lc" ]; then
+  grep -qsi '^COLOR.*none' /etc/GREP_COLORS
+fi
+if [ "$1" = "-c" ]; then
+  shift
+  exec /bin/sh -c "$1"
+fi
+exit 64
+"#,
+                shell_quote(&argv_log.display().to_string())
+            ),
+        )
+        .expect("write fake shell");
+
+        unsafe {
+            env::set_var("BASH_ENV", &bash_env);
+            env::set_var("ENV", &bash_env);
+            env::set_var(
+                "PROMPT_COMMAND",
+                "grep -qsi '^COLOR.*none' /etc/GREP_COLORS",
+            );
+        }
+        let status = execute_validated_shell(
+            &fake_shell.display().to_string(),
+            "printf shell-ok >/dev/null",
+        )
+        .expect("execute fake shell");
+        unsafe {
+            env::remove_var("BASH_ENV");
+            env::remove_var("ENV");
+            env::remove_var("PROMPT_COMMAND");
+        }
+
+        assert_eq!(status, 0);
+        assert_eq!(
+            read_to_string(&argv_log).expect("read argv"),
+            "-c\nprintf shell-ok >/dev/null\n"
+        );
+        assert_eq!(read_to_string(&startup_log).unwrap_or_default(), "");
+    }
+
+    #[test]
+    fn sanitize_explore_subprocess_env_blocks_fedora_grep_colors_startup_hook() {
+        let _guard = env_lock();
+        let root = temp_allowlist_dir().expect("temp root");
+        let repo = root.path.join("repo");
+        create_dir_all(&repo).expect("create repo");
+        let startup_log = root.path.join("startup.log");
+        let bash_env = root.path.join("bash-env.sh");
+        write(
+            &bash_env,
+            format!(
+                "grep -qsi '^COLOR.*none' /etc/GREP_COLORS || true\nprintf 'fedora-startup-ran\n' >> {}\n",
+                shell_quote(&startup_log.display().to_string())
+            ),
+        )
+        .expect("write bash env");
+        let allowlist = prepare_allowlist_environment().expect("allowlist environment");
+        let bash_path = resolve_host_command("bash").expect("host bash path");
+
+        unsafe {
+            env::set_var("BASH_ENV", &bash_env);
+            env::set_var("ENV", &bash_env);
+            env::set_var(
+                "PROMPT_COMMAND",
+                "grep -qsi '^COLOR.*none' /etc/GREP_COLORS",
+            );
+        }
+        let mut child = Command::new(bash_path);
+        child
+            .arg("--noprofile")
+            .arg("--norc")
+            .arg("-c")
+            .arg("true")
+            .env(HARNESS_ROOT_ENV, &repo)
+            .env(
+                "PATH",
+                build_codex_path(&allowlist.bin_dir, allowlist.sandbox_bin_dir.as_deref())
+                    .expect("restricted path"),
+            );
+        sanitize_explore_subprocess_env(&mut child);
+        let output = child.output().expect("run bash");
+        unsafe {
+            env::remove_var("BASH_ENV");
+            env::remove_var("ENV");
+            env::remove_var("PROMPT_COMMAND");
+        }
+
+        assert!(output.status.success());
+        assert_eq!(read_to_string(&startup_log).unwrap_or_default(), "");
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("/etc/GREP_COLORS"),
+            "stderr should not contain Fedora GREP_COLORS repo escape: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn invoke_codex_times_out_and_returns_bounded_failure() {
+        let _guard = env_lock();
+        let root = temp_allowlist_dir().expect("temp root");
+        let repo = root.path.join("repo");
+        create_dir_all(&repo).expect("create repo");
+        let prompt_file = root.path.join("prompt.md");
+        write(&prompt_file, "contract").expect("write prompt");
+        let fake_codex = root.path.join("codex-sleep");
+        write_executable(
+            &fake_codex,
+            r#"#!/bin/sh
+printf 'fake codex started
+' >&2
+/bin/sleep 5
+"#,
+        )
+        .expect("write fake codex");
+
+        unsafe {
+            env::set_var(CODEX_BIN_ENV, &fake_codex);
+            env::set_var(CODEX_TIMEOUT_MS_ENV, "100");
+        }
+        let started = Instant::now();
+        let attempt = invoke_codex(
+            &Args {
+                cwd: repo.clone(),
+                prompt: "find tests".to_string(),
+                prompt_file,
+                instructions_file: repo.join("AGENTS.md"),
+                spark_model: "spark-model".to_string(),
+                fallback_model: "fallback-model".to_string(),
+            },
+            "spark-model",
+            "contract",
+        )
+        .expect("invoke codex");
+        unsafe {
+            env::remove_var(CODEX_BIN_ENV);
+            env::remove_var(CODEX_TIMEOUT_MS_ENV);
+        }
+
+        assert_eq!(attempt.status_code, 124);
+        assert!(attempt.stderr.contains("timed out after 100ms"));
+        assert!(attempt.stderr.contains("terminated process tree"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(attempt.output_markdown.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_with_timeout_kills_process_group_children() {
+        let _env_guard = env_lock();
+        let _process_guard = process_tree_lock();
+        let root = temp_allowlist_dir().expect("temp root");
+        let term_file = root.path.join("grandchild.term");
+        let ready_file = root.path.join("grandchild.ready");
+        let script = root.path.join("spawn-grandchild.sh");
+        write_executable(
+            &script,
+            &format!(
+                r#"#!/bin/sh
+(trap 'printf term > {}; exit 0' TERM; printf ready > {}; sleep 30) &
+while [ ! -f {} ]; do
+  sleep 0.01
+done
+sleep 30
+"#,
+                shell_quote(&term_file.display().to_string()),
+                shell_quote(&ready_file.display().to_string()),
+                shell_quote(&ready_file.display().to_string()),
+            ),
+        )
+        .expect("write script");
+
+        let result = run_command_with_timeout(Command::new(&script), Duration::from_millis(500))
+            .expect("run with timeout");
+        let TimedCommandOutput::TimedOut { .. } = result else {
+            panic!("expected timeout");
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !term_file.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(read_to_string(&term_file).unwrap_or_default(), "term");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn run_command_with_timeout_aborts_suspicious_process_storm() {
+        let _env_guard = env_lock();
+        let _process_guard = process_tree_lock();
+        let root = temp_allowlist_dir().expect("temp root");
+        let script = root.path.join("storm.sh");
+        write_executable(
+            &script,
+            r#"#!/bin/sh
+while :; do
+  sleep 30 &
+  sleep 0.01
+done
+"#,
+        )
+        .expect("write script");
+
+        unsafe {
+            env::set_var(PROCESS_LIMIT_ENV, "12");
+        }
+        let started = Instant::now();
+        let result = run_command_with_timeout(Command::new(&script), Duration::from_secs(10))
+            .expect("run with process storm");
+        unsafe {
+            env::remove_var(PROCESS_LIMIT_ENV);
+        }
+
+        let TimedCommandOutput::ProcessLimitExceeded {
+            process_count,
+            process_limit,
+            ..
+        } = result
+        else {
+            panic!("expected process limit failure");
+        };
+        assert!(process_count > process_limit);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_with_timeout_fails_closed_on_large_stdout() {
+        let _env_guard = env_lock();
+        let _process_guard = process_tree_lock();
+        let root = temp_allowlist_dir().expect("temp root");
+        let script = root.path.join("large-stdout.sh");
+        write_executable(
+            &script,
+            r#"#!/bin/sh
+while :; do
+  printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+done
+"#,
+        )
+        .expect("write script");
+
+        unsafe {
+            env::set_var(CODEX_OUTPUT_LIMIT_BYTES_ENV, "4096");
+        }
+        let started = Instant::now();
+        let result = run_command_with_timeout(Command::new(&script), Duration::from_secs(10))
+            .expect("run with large stdout");
+        unsafe {
+            env::remove_var(CODEX_OUTPUT_LIMIT_BYTES_ENV);
+        }
+
+        let TimedCommandOutput::OutputLimitExceeded {
+            stream,
+            output_limit,
+            ..
+        } = result
+        else {
+            panic!("expected stdout output limit failure");
+        };
+        assert_eq!(stream, "stdout");
+        assert_eq!(output_limit, 4096);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_with_timeout_fails_closed_on_large_stderr() {
+        let _env_guard = env_lock();
+        let _process_guard = process_tree_lock();
+        let root = temp_allowlist_dir().expect("temp root");
+        let script = root.path.join("large-stderr.sh");
+        write_executable(
+            &script,
+            r#"#!/bin/sh
+while :; do
+  printf 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' >&2
+done
+"#,
+        )
+        .expect("write script");
+
+        unsafe {
+            env::set_var(CODEX_OUTPUT_LIMIT_BYTES_ENV, "4096");
+        }
+        let started = Instant::now();
+        let result = run_command_with_timeout(Command::new(&script), Duration::from_secs(10))
+            .expect("run with large stderr");
+        unsafe {
+            env::remove_var(CODEX_OUTPUT_LIMIT_BYTES_ENV);
+        }
+
+        let TimedCommandOutput::OutputLimitExceeded {
+            stream,
+            output_limit,
+            ..
+        } = result
+        else {
+            panic!("expected stderr output limit failure");
+        };
+        assert_eq!(stream, "stderr");
+        assert_eq!(output_limit, 4096);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_with_timeout_closes_inherited_stdio_after_parent_exit() {
+        let _env_guard = env_lock();
+        let _process_guard = process_tree_lock();
+        let root = temp_allowlist_dir().expect("temp root");
+        let script = root.path.join("inherited-stdio.sh");
+        write_executable(
+            &script,
+            r#"#!/bin/sh
+(sleep 30) &
+printf 'parent stdout\n'
+printf 'parent stderr\n' >&2
+exit 0
+"#,
+        )
+        .expect("write script");
+
+        let started = Instant::now();
+        let result = run_command_with_timeout(Command::new(&script), Duration::from_secs(10))
+            .expect("run with inherited stdio descendant");
+
+        let TimedCommandOutput::Completed(output) = result else {
+            panic!("expected parent completion");
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "reader cleanup should not wait for the descendant sleep"
+        );
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "parent stdout\n");
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "parent stderr\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_with_timeout_sweeps_detached_grandchildren_after_parent_exit() {
+        let _env_guard = env_lock();
+        let _process_guard = process_tree_lock();
+        let root = temp_allowlist_dir().expect("temp root");
+        let term_file = root.path.join("orphan.term");
+        let ready_file = root.path.join("orphan.ready");
+        let script = root.path.join("spawn-detached-grandchild.sh");
+        write_executable(
+            &script,
+            &format!(
+                r#"#!/bin/sh
+(trap 'printf term > {}; exit 0' TERM; printf ready > {}; sleep 30) >/dev/null 2>&1 &
+while [ ! -f {} ]; do
+  sleep 0.01
+done
+printf 'parent done\n'
+exit 0
+"#,
+                shell_quote(&term_file.display().to_string()),
+                shell_quote(&ready_file.display().to_string()),
+                shell_quote(&ready_file.display().to_string()),
+            ),
+        )
+        .expect("write script");
+
+        let result = run_command_with_timeout(Command::new(&script), Duration::from_secs(10))
+            .expect("run with detached grandchild");
+
+        let TimedCommandOutput::Completed(output) = result else {
+            panic!("expected parent completion");
+        };
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "parent done\n");
+        assert_eq!(read_to_string(&term_file).unwrap_or_default(), "term");
+    }
+
+    fn fallback_test_event() -> FallbackEvent {
+        FallbackEvent {
+            from_model: "spark-model".to_string(),
+            to_model: "fallback-model".to_string(),
+            exit_code: 17,
+            stderr: "spark timed out".to_string(),
+        }
+    }
+
+    #[test]
+    fn fallback_attempt_event_distinguishes_attempt_from_output_notice() {
+        let event = fallback_test_event();
+
+        let message = fallback_attempt_event_message(&event);
+        assert!(message.contains("fallback-attempt=model"));
+        assert!(message.contains("from=`spark-model`"));
+        assert!(message.contains("to=`fallback-model`"));
+        assert!(message.contains("spark_attempt_failed exit=17"));
+        assert!(message
+            .contains("stdout fallback notice is emitted only after successful fallback output"));
+        assert!(!message.contains("output includes a fallback notice"));
+        assert!(!message.contains("## OMX Explore fallback"));
+    }
+
+    #[test]
+    fn fallback_output_notice_records_model_boundary() {
+        let event = fallback_test_event();
+
+        let notice = fallback_output_notice(&event);
+        assert!(notice.contains("## OMX Explore fallback"));
+        assert!(notice.contains("fallback: model"));
+        assert!(notice.contains("from: `spark-model`"));
+        assert!(notice.contains("to: `fallback-model`"));
+        assert!(notice.contains("spark attempt failed with exit 17"));
+        assert!(notice.contains("cost/behavior may differ from the low-cost spark path"));
     }
 
     #[test]

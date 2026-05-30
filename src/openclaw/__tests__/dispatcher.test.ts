@@ -2,6 +2,11 @@
  * Tests for OpenClaw gateway dispatcher.
  */
 
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -11,7 +16,91 @@ import {
   interpolateInstruction,
   isCommandGateway,
   resolveCommandTimeoutMs,
+  wakeGateway,
 } from '../dispatcher.js';
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForProcessExit(pid: number, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!processExists(pid)) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail(`process ${pid} should exit before timeout`);
+}
+
+
+describe('wakeGateway proxy routing', () => {
+  const ORIGINAL_ENV = {
+    HTTP_PROXY: process.env.HTTP_PROXY,
+    http_proxy: process.env.http_proxy,
+    HTTPS_PROXY: process.env.HTTPS_PROXY,
+    https_proxy: process.env.https_proxy,
+    ALL_PROXY: process.env.ALL_PROXY,
+    all_proxy: process.env.all_proxy,
+    NO_PROXY: process.env.NO_PROXY,
+    no_proxy: process.env.no_proxy,
+  };
+
+  afterEach(() => {
+    for (const key of Object.keys(ORIGINAL_ENV) as Array<keyof typeof ORIGINAL_ENV>) {
+      const value = ORIGINAL_ENV[key];
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+
+  async function withServer(
+    handler: (req: IncomingMessage, res: ServerResponse) => void,
+    run: (baseUrl: string) => Promise<void>,
+  ): Promise<void> {
+    const server = createServer(handler);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const address = server.address() as AddressInfo;
+      await run(`http://127.0.0.1:${address.port}`);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  }
+
+  it('uses HTTP_PROXY for OpenClaw HTTP gateways', async () => {
+    const seen: string[] = [];
+    await withServer((_req, res) => {
+      res.statusCode = 500;
+      res.end('direct path should not be used');
+    }, async (targetUrl) => {
+      await withServer((req, res) => {
+        seen.push(req.url ?? '');
+        res.end('ok');
+      }, async (proxyUrl) => {
+        delete process.env.NO_PROXY;
+        delete process.env.no_proxy;
+        delete process.env.ALL_PROXY;
+        delete process.env.all_proxy;
+        process.env.HTTP_PROXY = proxyUrl;
+        delete process.env.http_proxy;
+        const result = await wakeGateway('local', { url: `${targetUrl}/wake` }, {
+          event: 'session-idle',
+          instruction: 'wake',
+          text: 'wake',
+          timestamp: '2026-05-05T00:00:00.000Z',
+          context: {},
+        });
+        assert.equal(result.success, true);
+        assert.deepEqual(seen, [`${targetUrl}/wake`]);
+      });
+    });
+  });
+});
 
 describe('validateGatewayUrl', () => {
   it('accepts https URLs', () => {
@@ -210,7 +299,40 @@ describe('wakeCommandGateway - command gate', () => {
       {},
     );
     assert.equal(result.success, false);
-    assert.ok(result.error?.includes('SIGTERM'));
+    assert.ok(result.error?.includes('timed out'));
+  });
+
+  it('kills shell-command descendants on timeout to avoid bash process leaks', async () => {
+    const { wakeCommandGateway } = await import('../dispatcher.js');
+      const cwd = await mkdtemp(join(tmpdir(), 'omx-openclaw-process-leak-'));
+    try {
+      const pidFile = join(cwd, 'grandchild.pid');
+      const scriptFile = join(cwd, 'spawn-grandchild.cjs');
+      const script = `
+        const { spawn } = require('node:child_process');
+        const { writeFileSync } = require('node:fs');
+        const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+          stdio: 'ignore'
+        });
+        writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));
+        setInterval(() => {}, 1000);
+      `;
+      await writeFile(scriptFile, script);
+      process.env.OMX_OPENCLAW_COMMAND = '1';
+
+      const result = await wakeCommandGateway(
+        'test',
+        { type: 'command', command: `${process.execPath} ${scriptFile}; true`, timeout: 500 },
+        {},
+      );
+      const pid = Number(await readFile(pidFile, 'utf8'));
+
+      assert.equal(result.success, false);
+      assert.ok(result.error?.includes('timed out'));
+      await waitForProcessExit(pid);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
   });
 
   it('uses gateway timeout over env timeout', async () => {
@@ -219,7 +341,7 @@ describe('wakeCommandGateway - command gate', () => {
     process.env.OMX_OPENCLAW_COMMAND_TIMEOUT_MS = '100';
     const result = await wakeCommandGateway(
       'test',
-      { type: 'command', command: "node -e \"setTimeout(() => {}, 250)\"", timeout: 500 },
+      { type: 'command', command: "node -e \"setTimeout(() => {}, 250)\"", timeout: 5000 },
       {},
     );
     assert.equal(result.success, true);

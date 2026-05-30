@@ -6,9 +6,18 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import TOML from "@iarna/toml";
-import { buildMergedConfig, mergeConfig, repairConfigIfNeeded } from "../generator.js";
+import {
+  buildMergedConfig,
+  cleanCodexModelAvailabilityNuxIfNeeded,
+  mergeConfig,
+  repairConfigIfNeeded,
+  stripManagedCodexHookTrustState,
+  upsertManagedCodexHookTrustState,
+} from "../generator.js";
+import { buildManagedCodexHookTrustState } from "../codex-hooks.js";
+import { OMX_FIRST_PARTY_MCP_SERVER_NAMES } from "../omx-first-party-mcp.js";
 
 /** Count occurrences of a pattern in text */
 function count(text: string, pattern: RegExp): number {
@@ -16,7 +25,10 @@ function count(text: string, pattern: RegExp): number {
 }
 
 /** Assert the current OMX block appears exactly once */
-function assertSingleOmxBlock(toml: string): void {
+function assertSingleOmxBlock(
+  toml: string,
+  options: { includeFirstPartyMcp?: boolean } = {},
+): void {
   assert.equal(
     count(toml, /# oh-my-codex \(OMX\) Configuration/g),
     1,
@@ -27,31 +39,17 @@ function assertSingleOmxBlock(toml: string): void {
     1,
     "End marker should appear once",
   );
-  assert.equal(
-    count(toml, /^\[mcp_servers\.omx_state\]$/gm),
-    1,
-    "[mcp_servers.omx_state] should appear once",
-  );
-  assert.equal(
-    count(toml, /^\[mcp_servers\.omx_memory\]$/gm),
-    1,
-    "[mcp_servers.omx_memory] should appear once",
-  );
-  assert.equal(
-    count(toml, /^\[mcp_servers\.omx_code_intel\]$/gm),
-    1,
-    "[mcp_servers.omx_code_intel] should appear once",
-  );
-  assert.equal(
-    count(toml, /^\[mcp_servers\.omx_trace\]$/gm),
-    1,
-    "[mcp_servers.omx_trace] should appear once",
-  );
-  assert.equal(
-    count(toml, /^\[mcp_servers\.omx_wiki\]$/gm),
-    1,
-    "[mcp_servers.omx_wiki] should appear once",
-  );
+  if (options.includeFirstPartyMcp) {
+    assertFirstPartyMcpBlocks(toml);
+  } else {
+    for (const name of OMX_FIRST_PARTY_MCP_SERVER_NAMES) {
+      assert.equal(
+        count(toml, new RegExp(`^\\[mcp_servers\\.${name}\\]$`, "gm")),
+        0,
+        `[mcp_servers.${name}] should not be emitted by default`,
+      );
+    }
+  }
   assert.equal(
     count(toml, /^\[mcp_servers\.omx_team_run\]$/gm),
     0,
@@ -69,9 +67,14 @@ function assertSingleOmxBlock(toml: string): void {
     "[features] should appear once",
   );
   assert.equal(
-    count(toml, /^codex_hooks = true$/gm),
+    count(toml, /^hooks = true$/gm),
     1,
-    "codex_hooks should appear once",
+    "hooks should appear once",
+  );
+  assert.equal(
+    count(toml, /^codex_hooks = true$/gm),
+    0,
+    "legacy codex_hooks should not be emitted",
   );
   assert.equal(
     count(toml, /^notify\s*=/gm),
@@ -88,13 +91,147 @@ function assertSingleOmxBlock(toml: string): void {
     1,
     "developer_instructions should appear once",
   );
-  assert.equal(count(toml, /^\[env\]$/gm), 1, "[env] should appear once");
+  assert.equal(count(toml, /^\[env\]$/gm), 0, "[env] should not be emitted");
   assert.equal(
-    count(toml, /^USE_OMX_EXPLORE_CMD = "1"$/gm),
+    count(toml, /^\[shell_environment_policy\.set\]$/gm),
+    1,
+    "[shell_environment_policy.set] should appear once",
+  );
+  assert.equal(
+    count(toml, /^USE_OMX_EXPLORE_CMD = "0"$/gm),
     1,
     "USE_OMX_EXPLORE_CMD should appear once",
   );
+
 }
+
+function assertFirstPartyMcpBlocks(toml: string): void {
+  const parsed = TOML.parse(toml) as {
+    mcp_servers?: Record<string, { command?: unknown }>;
+  };
+  for (const name of OMX_FIRST_PARTY_MCP_SERVER_NAMES) {
+    assert.equal(
+      count(toml, new RegExp(`^\\[mcp_servers\\.${name}\\]$`, "gm")),
+      1,
+      `[mcp_servers.${name}] should appear once when first-party MCP is enabled`,
+    );
+    const command = parsed.mcp_servers?.[name]?.command;
+    assert.equal(
+      command,
+      process.execPath,
+      `[mcp_servers.${name}] should use the Node executable that ran setup`,
+    );
+    assert.notEqual(
+      command,
+      "node",
+      `[mcp_servers.${name}] should not depend on PATH lookup for node`,
+    );
+    assert.equal(
+      typeof command === "string" && isAbsolute(command),
+      true,
+      `[mcp_servers.${name}] command should be absolute`,
+    );
+  }
+}
+
+function assertSingleManagedHookTrustState(toml: string): void {
+  const parsed = TOML.parse(toml) as {
+    hooks?: { state?: Record<string, { trusted_hash?: unknown }> };
+  };
+  const managedKeys = Object.keys(parsed.hooks?.state ?? {}).filter((key) =>
+    key.startsWith("/tmp/codex/hooks.json:"),
+  );
+
+  assert.deepEqual(
+    managedKeys.sort(),
+    [
+      "/tmp/codex/hooks.json:post_compact:0:0",
+      "/tmp/codex/hooks.json:post_tool_use:0:0",
+      "/tmp/codex/hooks.json:pre_compact:0:0",
+      "/tmp/codex/hooks.json:pre_tool_use:0:0",
+      "/tmp/codex/hooks.json:session_start:0:0",
+      "/tmp/codex/hooks.json:stop:0:0",
+      "/tmp/codex/hooks.json:user_prompt_submit:0:0",
+    ],
+  );
+  assert.equal(
+    count(toml, /^# OMX-owned Codex hook trust state$/gm),
+    1,
+    "managed hook trust fence should appear once",
+  );
+  assert.equal(
+    count(toml, /^# End OMX-owned Codex hook trust state$/gm),
+    1,
+    "managed hook trust end fence should appear once",
+  );
+  assert.equal(
+    count(toml, /^\[hooks\.state\."\/tmp\/codex\/hooks\.json:/gm),
+    managedKeys.length,
+    "managed hook trust tables should not duplicate",
+  );
+}
+
+describe("Codex transient TUI NUX cleanup", () => {
+  it("removes only model availability NUX counters from project-local config", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-codex-nux-cleanup-"));
+    try {
+      const configPath = join(wd, "config.toml");
+      await writeFile(configPath, [
+        'model = "gpt-5.5"',
+        'status_line = ["model-with-reasoning", "git-branch"]',
+        "",
+        "[tui]",
+        'theme = "dark"',
+        "notifications = true",
+        "",
+        "[tui.model_availability_nux]",
+        '"gpt-5.5" = 4',
+        '"gpt-5.4" = 1',
+        "",
+        "[mcp_servers.user]",
+        'command = "node"',
+        'args = ["server.js"]',
+        "",
+      ].join("\n"));
+
+      const cleaned = await cleanCodexModelAvailabilityNuxIfNeeded(configPath);
+      const toml = await readFile(configPath, "utf-8");
+
+      assert.equal(cleaned, true);
+      assert.doesNotMatch(toml, /^\[tui\.model_availability_nux\]$/m);
+      assert.doesNotMatch(toml, /gpt-5\.5" = 4/);
+      assert.match(toml, /^status_line = \["model-with-reasoning", "git-branch"\]$/m);
+      assert.match(toml, /^\[tui\]$/m);
+      assert.match(toml, /^theme = "dark"$/m);
+      assert.match(toml, /^notifications = true$/m);
+      assert.match(toml, /^\[mcp_servers\.user\]$/m);
+      assert.match(toml, /^command = "node"$/m);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("is a no-op when project config has no Codex NUX counters", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-codex-nux-noop-"));
+    try {
+      const configPath = join(wd, "config.toml");
+      const original = [
+        'model = "gpt-5.5"',
+        "",
+        "[tui]",
+        'theme = "dark"',
+        "",
+      ].join("\n");
+      await writeFile(configPath, original);
+
+      const cleaned = await cleanCodexModelAvailabilityNuxIfNeeded(configPath);
+      assert.equal(cleaned, false);
+      assert.equal(await readFile(configPath, "utf-8"), original);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("config generator idempotency (#384)", () => {
   it("first run creates config with all current OMX sections", async () => {
@@ -107,10 +244,48 @@ describe("config generator idempotency (#384)", () => {
       assertSingleOmxBlock(toml);
       assert.match(toml, /^multi_agent = true$/m);
       assert.match(toml, /^child_agents_md = true$/m);
-      assert.match(toml, /^codex_hooks = true$/m);
+      assert.match(toml, /^hooks = true$/m);
+      assert.match(toml, /^goals = true$/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
+  });
+
+  it("emits first-party MCP blocks only when explicitly enabled", () => {
+    const toml = buildMergedConfig("", "/tmp/omx", {
+      includeFirstPartyMcp: true,
+    });
+
+    assertSingleOmxBlock(toml, { includeFirstPartyMcp: true });
+  });
+
+  it("omits first-party MCP blocks in no-MCP mode while preserving user MCP servers", () => {
+    const compatConfig = buildMergedConfig(
+      [
+        "[mcp_servers.user_tool]",
+        'command = "user-tool"',
+        'args = ["serve"]',
+        "enabled = true",
+        "",
+      ].join("\n"),
+      "/tmp/omx",
+      { includeFirstPartyMcp: true },
+    );
+    const noMcpConfig = buildMergedConfig(compatConfig, "/tmp/omx", {
+      includeFirstPartyMcp: false,
+    });
+
+    assertSingleOmxBlock(noMcpConfig);
+    assert.match(
+      noMcpConfig,
+      /^\[mcp_servers\.user_tool\]$/m,
+      "user-authored MCP servers should not be removed by no-MCP mode",
+    );
+    assert.doesNotMatch(
+      noMcpConfig,
+      /dist\/mcp\/state-server\.js/,
+      "first-party MCP entrypoints should be removed when no-MCP mode is selected",
+    );
   });
 
   it("second run updates without duplicating any section", async () => {
@@ -164,6 +339,7 @@ describe("config generator idempotency (#384)", () => {
         "",
         "[features]",
         "multi_agent = true",
+        "goals = false",
         "",
         "[mcp_servers.omx_state]",
         'command = "node"',
@@ -240,6 +416,34 @@ describe("config generator idempotency (#384)", () => {
     }
   });
 
+  it("preserves user-owned omx-prefixed MCP servers that are not first-party", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-idem-"));
+    try {
+      const configPath = join(wd, "config.toml");
+      const userMcp = [
+        "[mcp_servers.omx_custom]",
+        'command = "node"',
+        'args = ["/user/custom-server.js"]',
+        "enabled = true",
+        "",
+      ].join("\n");
+      await writeFile(configPath, userMcp);
+
+      await mergeConfig(configPath, wd);
+      const toml = await readFile(configPath, "utf-8");
+
+      assertSingleOmxBlock(toml);
+      assert.match(
+        toml,
+        /^\[mcp_servers\.omx_custom\]$/m,
+        "user-owned omx-prefixed MCP server preserved",
+      );
+      assert.match(toml, /^args = \["\/user\/custom-server\.js"\]$/m);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it("preserves user content between OMX re-runs", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-idem-"));
     try {
@@ -280,6 +484,7 @@ describe("config generator idempotency (#384)", () => {
       const orphanedAgents = [
         "[features]",
         "multi_agent = true",
+        "goals = false",
         "",
         "# OMX Native Agent Roles (Codex multi-agent)",
         "",
@@ -358,7 +563,7 @@ describe("config generator idempotency (#384)", () => {
     }
   });
 
-  it("merges OMX status_line into an existing user [tui] section without duplicating the table", async () => {
+  it("preserves a user-owned status_line in an existing [tui] section", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-idem-"));
     try {
       const configPath = join(wd, "config.toml");
@@ -371,18 +576,98 @@ describe("config generator idempotency (#384)", () => {
       await writeFile(configPath, userTui);
 
       await mergeConfig(configPath, wd);
+      await mergeConfig(configPath, wd);
       const toml = await readFile(configPath, "utf-8");
 
       assert.equal(count(toml, /^\[tui\]$/gm), 1, "[tui] should appear once");
       assert.match(toml, /^theme = "night"$/m, "user tui key preserved");
       assert.match(
         toml,
-        /^status_line = \["model-with-reasoning", "git-branch", "context-remaining", "total-input-tokens", "total-output-tokens", "five-hour-limit", "weekly-limit"\]$/m,
-        "status_line updated in-place",
+        /^status_line = \["git-branch"\]$/m,
+        "user status_line preserved",
       );
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
+  });
+
+  it("seeds the default status_line into a fresh [tui] section", () => {
+    const toml = buildMergedConfig("", "/tmp/omx");
+
+    assert.equal(count(toml, /^\[tui\]$/gm), 1, "[tui] should appear once");
+    assert.match(
+      toml,
+      /^status_line = \["model-with-reasoning", "git-branch", "context-remaining", "total-input-tokens", "total-output-tokens", "five-hour-limit", "weekly-limit"\]$/m,
+    );
+  });
+
+  it("seeds the default status_line into an existing [tui] section without one", () => {
+    const toml = buildMergedConfig(
+      ["[tui]", 'theme = "night"', ""].join("\n"),
+      "/tmp/omx",
+    );
+
+    assert.equal(count(toml, /^\[tui\]$/gm), 1, "[tui] should appear once");
+    assert.match(toml, /^theme = "night"$/m, "existing tui key preserved");
+    assert.match(
+      toml,
+      /^status_line = \["model-with-reasoning", "git-branch", "context-remaining", "total-input-tokens", "total-output-tokens", "five-hour-limit", "weekly-limit"\]$/m,
+      "default status_line should be seeded when [tui] lacks one",
+    );
+  });
+
+  it("preserves a multiline user-owned status_line", () => {
+    const toml = buildMergedConfig(
+      [
+        "[tui]",
+        "status_line = [",
+        '  "git-branch",',
+        '  "context-remaining",',
+        "]",
+        "",
+      ].join("\n"),
+      "/tmp/omx",
+    );
+
+    assert.equal(count(toml, /^\[tui\]$/gm), 1, "[tui] should appear once");
+    assert.ok(
+      toml.includes(
+        [
+          "status_line = [",
+          '"git-branch",',
+          '"context-remaining",',
+          "]",
+        ].join("\n"),
+      ),
+      "multiline user status_line should be preserved",
+    );
+    assert.doesNotMatch(
+      toml,
+      /^status_line = \["model-with-reasoning", "git-branch", "context-remaining", "total-input-tokens", "total-output-tokens", "five-hour-limit", "weekly-limit"\]$/m,
+      "default status_line should not overwrite multiline customization",
+    );
+  });
+
+  it("preserves a customized managed-block status_line when refreshing setup", () => {
+    const firstRun = buildMergedConfig("", "/tmp/omx");
+    const customized = firstRun.replace(
+      /^status_line = \["model-with-reasoning", "git-branch", "context-remaining", "total-input-tokens", "total-output-tokens", "five-hour-limit", "weekly-limit"\]$/m,
+      'status_line = ["git-branch", "context-remaining"]',
+    );
+
+    const refreshed = buildMergedConfig(customized, "/tmp/omx");
+
+    assert.equal(count(refreshed, /^\[tui\]$/gm), 1, "[tui] should appear once");
+    assert.match(
+      refreshed,
+      /^status_line = \["git-branch", "context-remaining"\]$/m,
+      "customized status_line should survive managed-block stripping",
+    );
+    assert.doesNotMatch(
+      refreshed,
+      /^status_line = \["model-with-reasoning", "git-branch", "context-remaining", "total-input-tokens", "total-output-tokens", "five-hour-limit", "weekly-limit"\]$/m,
+      "default status_line should not overwrite customization",
+    );
   });
 
   it("skips emitting an OMX [tui] table when includeTui is disabled", () => {
@@ -391,27 +676,56 @@ describe("config generator idempotency (#384)", () => {
     });
 
     assert.doesNotMatch(toml, /^\[tui\]$/m);
-    assert.match(toml, /^\[mcp_servers\.omx_state\]$/m);
-    assert.match(toml, /^\[env\]$/m);
-    assert.match(toml, /^USE_OMX_EXPLORE_CMD = "1"$/m);
+    assert.doesNotMatch(toml, /^\[mcp_servers\.omx_state\]$/m);
+    assert.match(toml, /^\[shell_environment_policy\.set\]$/m);
+    assert.match(toml, /^USE_OMX_EXPLORE_CMD = "0"$/m);
   });
 
-  it('seeds USE_OMX_EXPLORE_CMD=1 into generated config by default', () => {
+  it('seeds USE_OMX_EXPLORE_CMD=0 into generated config by default', () => {
     const toml = buildMergedConfig('', '/tmp/omx');
 
-    assert.match(toml, /^\[env\]$/m);
-    assert.match(toml, /^USE_OMX_EXPLORE_CMD = "1"$/m);
+    assert.doesNotMatch(toml, /^\[env\]$/m);
+    assert.match(toml, /^\[shell_environment_policy\.set\]$/m);
+    assert.match(toml, /^USE_OMX_EXPLORE_CMD = "0"$/m);
   });
 
-  it('preserves existing [env] keys and explicit explore routing opt-outs', () => {
+  it('migrates existing [env] keys and explicit explore routing opt-outs', () => {
     const toml = buildMergedConfig(
       ['[env]', 'FOO = "bar"', 'USE_OMX_EXPLORE_CMD = "0"', ''].join('\n'),
       '/tmp/omx',
     );
 
-    assert.match(toml, /^\[env\]$/m);
+    assert.doesNotMatch(toml, /^\[env\]$/m);
+    assert.match(toml, /^\[shell_environment_policy\.set\]$/m);
     assert.match(toml, /^FOO = "bar"$/m);
     assert.match(toml, /^USE_OMX_EXPLORE_CMD = "0"$/m);
+  });
+
+  it("migrates multiline [env] values without truncating TOML entries", () => {
+    const toml = buildMergedConfig(
+      [
+        "[env]",
+        'FOO = """first line',
+        "  second line",
+        'third line"""',
+        "BAR = [",
+        '  "one",',
+        '  "two",',
+        "]",
+        "",
+      ].join("\n"),
+      "/tmp/omx",
+    );
+
+    assert.doesNotMatch(toml, /^\[env\]$/m);
+    assert.match(toml, /^\[shell_environment_policy\.set\]$/m);
+    assert.match(
+      toml,
+      /FOO = """first line\n  second line\nthird line"""/,
+    );
+    assert.match(toml, /BAR = \[\n  "one",\n  "two",\n\]/);
+    assert.match(toml, /^USE_OMX_EXPLORE_CMD = "0"$/m);
+    assert.doesNotThrow(() => TOML.parse(toml));
   });
 
   it("replaces an existing OMX notify entry without leaving orphan fragments behind", async () => {
@@ -777,6 +1091,268 @@ describe("config generator idempotency (#384)", () => {
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
+  });
+
+  it("preserves trailing user config after an unmatched managed hook trust-state start marker", () => {
+    const malformed = [
+      'model = "gpt-5.5"',
+      "",
+      "# OMX-owned Codex hook trust state",
+      "# Missing the end fence must not cause trailing user config deletion.",
+      "",
+      '[hooks.state."custom:/hooks.json:stop:0:0"]',
+      'trusted_hash = "sha256:user"',
+      "enabled = false",
+      "",
+      "[hooks.state.user_prompt_submit]",
+      'trusted_hash = "sha256:prompt"',
+      "enabled = true",
+      "",
+    ].join("\n");
+
+    const stripped = stripManagedCodexHookTrustState(malformed);
+
+    assert.match(stripped, /^# OMX-owned Codex hook trust state$/m);
+    assert.match(stripped, /^\[hooks\.state\."custom:\/hooks\.json:stop:0:0"\]$/m);
+    assert.match(stripped, /^enabled = false$/m);
+    assert.match(stripped, /^\[hooks\.state\.user_prompt_submit\]$/m);
+    assert.match(stripped, /^trusted_hash = "sha256:prompt"$/m);
+    assert.doesNotThrow(() => TOML.parse(stripped));
+  });
+
+  it("removes orphaned managed hook trust-state tables only when hashes prove ownership", () => {
+    const hooksPath = "/tmp/codex/hooks.json";
+    const managedTrustState = buildManagedCodexHookTrustState(hooksPath, "/tmp/omx");
+    const managedPostCompactHash =
+      managedTrustState[`${hooksPath}:post_compact:0:0`]?.trusted_hash;
+    const managedStopHash = managedTrustState[`${hooksPath}:stop:0:0`]?.trusted_hash;
+    assert.ok(managedPostCompactHash);
+    assert.ok(managedStopHash);
+    const orphaned = [
+      'model = "gpt-5.5"',
+      "",
+      "[hooks.state]",
+      "",
+      '[plugins."oh-my-codex@oh-my-codex-local"]',
+      "enabled = true",
+      "",
+      '[hooks.state."/tmp/codex/hooks.json:post_compact:0:0"]',
+      `trusted_hash = "${managedPostCompactHash}"`,
+      "",
+      '[hooks.state."/tmp/codex/hooks.json:stop:0:0"]',
+      `trusted_hash = "${managedStopHash}"`,
+      "",
+      '[hooks.state."custom:/hooks.json:stop:0:0"]',
+      'trusted_hash = "sha256:user"',
+      "",
+      "# End OMX-owned Codex hook trust state",
+      "",
+      "[desktop]",
+      "git-create-pull-request-as-draft = true",
+      "",
+    ].join("\n");
+
+    const stripped = stripManagedCodexHookTrustState(orphaned, {
+      managedTrustState,
+    });
+
+    assert.doesNotMatch(stripped, /\/tmp\/codex\/hooks\.json:post_compact:0:0/);
+    assert.doesNotMatch(stripped, /\/tmp\/codex\/hooks\.json:stop:0:0/);
+    assert.match(stripped, /^# End OMX-owned Codex hook trust state$/m);
+    assert.match(stripped, /^\[hooks\.state\."custom:\/hooks\.json:stop:0:0"\]$/m);
+    assert.match(stripped, /^trusted_hash = "sha256:user"$/m);
+    assert.match(stripped, /^\[desktop\]$/m);
+    assert.doesNotThrow(() => TOML.parse(stripped));
+  });
+
+  it("preserves same-key user hook trust state and suppresses generated duplicates", () => {
+    const hooksPath = "/tmp/codex/hooks.json";
+    const config = [
+      'model = "gpt-5.5"',
+      "",
+      '[hooks.state."/tmp/codex/hooks.json:post_compact:0:0"]',
+      'trusted_hash = "sha256:user"',
+      "enabled = false",
+      "",
+    ].join("\n");
+
+    const refreshed = upsertManagedCodexHookTrustState(
+      config,
+      "/tmp/omx",
+      hooksPath,
+    );
+
+    assert.match(refreshed, /^trusted_hash = "sha256:user"$/m);
+    assert.match(refreshed, /^enabled = false$/m);
+    assert.equal(
+      count(
+        refreshed,
+        /^\[hooks\.state\."\/tmp\/codex\/hooks\.json:post_compact:0:0"\]$/gm,
+      ),
+      1,
+      "preserved same-key user trust state must not be duplicated",
+    );
+    assert.doesNotThrow(() => TOML.parse(refreshed));
+  });
+
+  it("preserves unproven same-key hook trust-state tables", () => {
+    const hooksPath = "/tmp/codex/hooks.json";
+    const managedTrustState = buildManagedCodexHookTrustState(hooksPath, "/tmp/omx");
+    const fixtures = [
+      [
+        "missing hash",
+        [
+          '[hooks.state."/tmp/codex/hooks.json:post_compact:0:0"]',
+          "enabled = false",
+        ],
+      ],
+      [
+        "malformed hash",
+        [
+          '[hooks.state."/tmp/codex/hooks.json:post_compact:0:0"]',
+          "trusted_hash = true",
+        ],
+      ],
+      [
+        "extra assignment",
+        [
+          '[hooks.state."/tmp/codex/hooks.json:post_compact:0:0"]',
+          'trusted_hash = "sha256:user"',
+          "enabled = false",
+        ],
+      ],
+      [
+        "body comment",
+        [
+          '[hooks.state."/tmp/codex/hooks.json:post_compact:0:0"]',
+          "# user comment",
+          'trusted_hash = "sha256:user"',
+        ],
+      ],
+      [
+        "inline body comment",
+        [
+          '[hooks.state."/tmp/codex/hooks.json:post_compact:0:0"]',
+          'trusted_hash = "sha256:user" # user comment',
+        ],
+      ],
+      [
+        "inline header comment",
+        [
+          '[hooks.state."/tmp/codex/hooks.json:post_compact:0:0"] # user comment',
+          'trusted_hash = "sha256:user"',
+        ],
+      ],
+    ] as const;
+
+    for (const [name, table] of fixtures) {
+      const stripped = stripManagedCodexHookTrustState(table.join("\n"), {
+        managedTrustState,
+      });
+      assert.match(
+        stripped,
+        /^\[hooks\.state\."\/tmp\/codex\/hooks\.json:post_compact:0:0"\]/m,
+        `${name} should be preserved`,
+      );
+    }
+  });
+
+  it("does not remove unfenced hook trust-state tables without a proof map", () => {
+    const config = [
+      '[hooks.state."/tmp/codex/hooks.json:post_compact:0:0"]',
+      'trusted_hash = "sha256:managed-looking"',
+      "",
+    ].join("\n");
+
+    const stripped = stripManagedCodexHookTrustState(config);
+
+    assert.match(stripped, /managed-looking/);
+  });
+
+  it("dedupes prior fenced managed hook trust-state blocks before writing a replacement", () => {
+    const first = upsertManagedCodexHookTrustState(
+      [
+        'model = "gpt-5.5"',
+        "",
+        '[hooks.state."custom:/hooks.json:stop:0:0"]',
+        'trusted_hash = "sha256:user"',
+        "enabled = false",
+        "",
+      ].join("\n"),
+      "/tmp/omx",
+      "/tmp/codex/hooks.json",
+    );
+    const brokenWithDuplicatePriorBlock = `${first}\n${first.slice(
+      first.indexOf("# OMX-owned Codex hook trust state"),
+    )}`;
+    assert.equal(
+      count(
+        brokenWithDuplicatePriorBlock,
+        /^\[hooks\.state\."\/tmp\/codex\/hooks\.json:stop:0:0"\]$/gm,
+      ),
+      2,
+      "regression fixture should contain duplicate managed trust tables",
+    );
+
+    const repaired = upsertManagedCodexHookTrustState(
+      brokenWithDuplicatePriorBlock,
+      "/tmp/omx",
+      "/tmp/codex/hooks.json",
+    );
+    const repeated = upsertManagedCodexHookTrustState(
+      repaired,
+      "/tmp/omx",
+      "/tmp/codex/hooks.json",
+    );
+
+    assert.equal(repeated, repaired);
+    assert.match(
+      repaired,
+      /^\[hooks\.state\."custom:\/hooks\.json:stop:0:0"\]$/m,
+      "unrelated user hook state should be preserved",
+    );
+    assert.match(repaired, /^enabled = false$/m);
+    assertSingleManagedHookTrustState(repaired);
+  });
+
+  it("dedupes stale unfenced managed hook trust-state tables during legacy setup refresh", () => {
+    const hooksPath = "/tmp/codex/hooks.json";
+    const stalePluginModeConfig = [
+      "[features]",
+      "codex_hooks = true",
+      "goals = true",
+      "",
+      '[hooks.state."custom:/hooks.json:stop:0:0"]',
+      'trusted_hash = "sha256:user"',
+      "enabled = false",
+      "",
+      // Regression fixture for #2225: plugin-mode state could be left outside
+      // the managed fence, then legacy setup appended the same table again.
+      '[hooks.state."/tmp/codex/hooks.json:post_compact:0:0"]',
+      'trusted_hash = "sha256:stale-plugin-mode"',
+      "",
+    ].join("\n");
+
+    const refreshed = buildMergedConfig(stalePluginModeConfig, "/tmp/omx", {
+      codexHooksFile: hooksPath,
+    });
+
+    assert.doesNotThrow(() => TOML.parse(refreshed));
+    assert.equal(
+      count(
+        refreshed,
+        /^\[hooks\.state\."\/tmp\/codex\/hooks\.json:post_compact:0:0"\]$/gm,
+      ),
+      1,
+      "legacy refresh should replace the stale plugin-mode managed hook state",
+    );
+    assert.match(
+      refreshed,
+      /^\[hooks\.state\."custom:\/hooks\.json:stop:0:0"\]$/m,
+      "unrelated user hook state should be preserved",
+    );
+    assert.match(refreshed, /^enabled = false$/m);
+    assertSingleManagedHookTrustState(refreshed);
   });
 
   it("syncs shared MCP registry entries in a dedicated managed block", async () => {

@@ -1,15 +1,20 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { updateModeState, startMode, readModeState } from '../modes/base.js';
-import { getStatePath, validateSessionId } from '../mcp/state-paths.js';
+import { getStateFilePath, getStatePath, validateSessionId } from '../mcp/state-paths.js';
 import { monitorTeam, resumeTeam, shutdownTeam, startTeam, type TeamRuntime, type TeamSnapshot } from '../team/runtime.js';
+import { buildRepoAwareTeamExecutionPlan } from '../team/repo-aware-decomposition.js';
 import { DEFAULT_MAX_WORKERS } from '../team/state.js';
 import { sanitizeTeamName } from '../team/tmux-session.js';
 import { readTeamEvents, waitForTeamEvent } from '../team/state/events.js';
 import type { TeamEvent } from '../team/state.js';
 import { parseWorktreeMode, type WorktreeMode } from '../team/worktree.js';
 import { classifyTaskSize } from '../hooks/task-size-detector.js';
-import { readApprovedExecutionLaunchHint } from '../planning/artifacts.js';
+import {
+  readApprovedExecutionLaunchHintOutcome,
+  type ApprovedExecutionLaunchHint,
+  type ApprovedRepositoryContextSummary,
+} from '../planning/artifacts.js';
 import { routeTaskToRole } from '../team/role-router.js';
 import { allocateTasksToWorkers } from '../team/allocation-policy.js';
 import {
@@ -24,8 +29,20 @@ import {
   type TeamApiOperation,
 } from '../team/api-interop.js';
 import { teamReadConfig as readTeamConfig, teamReadPhase as readTeamPhase } from '../team/team-ops.js';
+import { resolveTeamNameForCurrentContext } from '../team/team-identity.js';
 import { recordLeaderRuntimeActivity } from '../team/leader-activity.js';
 import { readTeamPaneStatus } from '../team/pane-status.js';
+import {
+  buildApprovedTeamExecutionBinding,
+  resolvePersistedApprovedTeamExecutionContinuityStateSync,
+  type ApprovedTeamExecutionBinding,
+} from '../team/approved-execution.js';
+import {
+  buildUltragoalCheckpointGuidance,
+  readPersistedTeamUltragoalContext,
+  renderUltragoalCheckpointGuidanceText,
+} from '../team/ultragoal-context.js';
+import { resolveCodexHomeForLaunch } from './codex-home.js';
 
 interface TeamCliOptions {
   verbose?: boolean;
@@ -38,8 +55,12 @@ interface ParsedTeamArgs {
   explicitWorkerCount: boolean;
   task: string;
   teamName: string;
+  displayName?: string;
+  allowRepoAwareDagHandoff: boolean;
+  dagFallbackReason?: string;
+  approvedRepositoryContextSummary?: ApprovedRepositoryContextSummary;
+  approvedExecution?: ApprovedTeamExecutionBinding;
 }
-
 
 interface TeamFollowupContext {
   task: string;
@@ -47,6 +68,7 @@ interface TeamFollowupContext {
   explicitWorkerCount: boolean;
   agentType?: string;
   explicitAgentType?: boolean;
+  approvedHint?: ApprovedExecutionLaunchHint;
 }
 
 function persistExactTeamModeState(
@@ -67,6 +89,9 @@ function persistExactTeamModeState(
 }
 
 function readPersistedTeamFollowupState(cwd: string): {
+  active?: boolean;
+  team_name?: string;
+  team_state_root?: string;
   task?: string;
   task_description?: string;
   workerCount?: number;
@@ -75,51 +100,144 @@ function readPersistedTeamFollowupState(cwd: string): {
   agent_types?: string;
   linkedRalph?: boolean;
 } | null {
-  const path = join(cwd, '.omx', 'state', 'team-state.json');
-  if (!existsSync(path)) return null;
-  try {
-    return JSON.parse(readFileSync(path, 'utf-8')) as {
-      task?: string;
-      workerCount?: number;
-      agentType?: string;
-      linkedRalph?: boolean;
-      task_description?: string;
-      agent_count?: number;
-      agent_types?: string;
-    };
-  } catch {
-    return null;
+  const readState = (path: string) => {
+    if (!existsSync(path)) return null;
+    try {
+      return JSON.parse(readFileSync(path, 'utf-8')) as {
+        active?: boolean;
+        team_name?: string;
+        team_state_root?: string;
+        task?: string;
+        workerCount?: number;
+        agentType?: string;
+        linkedRalph?: boolean;
+        task_description?: string;
+        agent_count?: number;
+        agent_types?: string;
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  const isActiveTeamState = (state: {
+    active?: boolean;
+    team_name?: string;
+  } | null): state is {
+    active: true;
+    team_name: string;
+    team_state_root?: string;
+    task?: string;
+    task_description?: string;
+    workerCount?: number;
+    agent_count?: number;
+    agentType?: string;
+    agent_types?: string;
+    linkedRalph?: boolean;
+  } => state?.active === true && typeof state.team_name === 'string' && state.team_name.trim() !== '';
+
+  const sessionStatePath = getStateFilePath('session.json', cwd);
+  let scopedSessionId: string | undefined;
+  if (existsSync(sessionStatePath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(sessionStatePath, 'utf-8')) as { session_id?: unknown };
+      scopedSessionId = validateSessionId(parsed.session_id);
+    } catch {
+      // Best-effort state lookup only.
+    }
   }
+
+  if (scopedSessionId) {
+    const scopedState = readState(getStatePath('team', cwd, scopedSessionId));
+    if (isActiveTeamState(scopedState)) {
+      return scopedState;
+    }
+  }
+
+  const path = getStatePath('team', cwd);
+  if (!existsSync(path)) return null;
+  const state = readState(path);
+  return isActiveTeamState(state) ? state : null;
 }
 
 function resolveApprovedTeamFollowupContext(cwd: string, task: string): TeamFollowupContext | null {
   const normalizedTask = task.trim();
   if (!normalizedTask) return null;
 
-  const existingTeamState = readPersistedTeamFollowupState(cwd);
   const shortFollowup = ['team', 'team으로 해줘', 'team으로 해주세요'].includes(normalizedTask);
   if (!shortFollowup) return null;
 
-  const approvedHint = readApprovedExecutionLaunchHint(cwd, 'team');
-  if (!approvedHint) return null;
-
+  const existingTeamState = readPersistedTeamFollowupState(cwd);
+  const persistedTeamName = typeof existingTeamState?.team_name === 'string'
+    ? existingTeamState.team_name.trim()
+    : '';
+  const persistedTeamStateRoot = typeof existingTeamState?.team_state_root === 'string'
+    && existingTeamState.team_state_root.trim() !== ''
+    ? existingTeamState.team_state_root.trim()
+    : undefined;
   const persistedTask = typeof existingTeamState?.task_description === 'string'
-    ? existingTeamState.task_description
+    ? existingTeamState.task_description.trim()
     : typeof existingTeamState?.task === 'string'
-      ? existingTeamState.task
-      : null;
+      ? existingTeamState.task.trim()
+      : '';
   const persistedWorkerCount = typeof existingTeamState?.agent_count === 'number'
     ? existingTeamState.agent_count
     : typeof existingTeamState?.workerCount === 'number'
       ? existingTeamState.workerCount
       : null;
-  if (persistedTask && persistedWorkerCount && persistedTask.trim() === approvedHint.task.trim()) {
+  const persistedAgentType = typeof existingTeamState?.agentType === 'string'
+    && existingTeamState.agentType.trim() !== ''
+    ? existingTeamState.agentType.trim()
+    : undefined;
+  const persistedLinkedRalph = typeof existingTeamState?.linkedRalph === 'boolean'
+    ? existingTeamState.linkedRalph
+    : undefined;
+  let approvedHint: ApprovedExecutionLaunchHint | null = null;
+
+  if (persistedTeamName !== '') {
+    const continuity = resolvePersistedApprovedTeamExecutionContinuityStateSync(
+      persistedTeamName,
+      cwd,
+      persistedTeamStateRoot,
+    );
+    if (continuity.status === 'malformed') {
+      throw new Error(`approved_execution_binding_malformed:${persistedTeamName}`);
+    }
+    if (continuity.status === 'ambiguous') {
+      throw new Error(
+        `approved_execution_binding_ambiguous:${continuity.binding.prd_path}:${continuity.binding.task}`,
+      );
+    }
+    if (continuity.status === 'stale') {
+      throw new Error(`approved_execution_binding_stale:${continuity.binding.prd_path}:${continuity.binding.task}`);
+    }
+    if (continuity.status === 'valid') {
+      approvedHint = continuity.approvedHint;
+    }
+  }
+
+  if (!approvedHint) {
+    const approvedHintOutcome = readApprovedExecutionLaunchHintOutcome(cwd, 'team', {
+      ...(persistedTask !== '' ? { task: persistedTask } : {}),
+      ...(persistedWorkerCount != null ? { workerCount: persistedWorkerCount } : {}),
+      ...(persistedAgentType ? { agentType: persistedAgentType } : {}),
+      ...(persistedLinkedRalph != null ? { linkedRalph: persistedLinkedRalph } : {}),
+    });
+    if (approvedHintOutcome.status === 'ambiguous') {
+      throw new Error('approved_execution_hint_ambiguous:team');
+    }
+    if (approvedHintOutcome.status !== 'resolved') return null;
+    approvedHint = approvedHintOutcome.hint;
+  }
+
+  if (persistedTask !== '' && persistedWorkerCount && persistedTask === approvedHint.task.trim()) {
     return {
       task: persistedTask,
       workerCount: persistedWorkerCount,
       explicitWorkerCount: true,
       agentType: approvedHint.agentType,
       explicitAgentType: approvedHint.agentType != null,
+      approvedHint,
     };
   }
 
@@ -129,7 +247,25 @@ function resolveApprovedTeamFollowupContext(cwd: string, task: string): TeamFoll
     explicitWorkerCount: approvedHint.workerCount != null,
     agentType: approvedHint.agentType,
     explicitAgentType: approvedHint.agentType != null,
+    approvedHint,
   };
+}
+
+function buildExplicitOmxTeamLaunchCommand(
+  task: string,
+  workerCount: number,
+  explicitWorkerCount: boolean,
+  agentType: string,
+  explicitAgentType: boolean,
+): string | null {
+  if (!explicitWorkerCount) {
+    return null;
+  }
+
+  const countToken = explicitAgentType
+    ? `${workerCount}:${agentType}`
+    : String(workerCount);
+  return `omx team ${countToken} ${JSON.stringify(task)}`;
 }
 
 const MIN_WORKER_COUNT = 1;
@@ -143,7 +279,7 @@ function isTerminalModePhase(phase: string): boolean {
 
 const TEAM_HELP = `
 Usage: omx team [N:agent-type] "<task description>"
-       omx team status <team-name> [--json] [--tail-lines <100-1000>]
+       omx team status <team-name> [--json] [--tail-lines <100-1000>] [--model-inspect]
        omx team await <team-name> [--timeout-ms <ms>] [--after-event-id <id>] [--json]
        omx team resume <team-name>
        omx team shutdown <team-name> [--force] [--confirm-issues]
@@ -155,12 +291,13 @@ Notes:
   --worktree is deprecated for omx team and is now only a backward-compatible no-op override.
   omx team is a tmux-runtime surface by default; in Codex App or plain outside-tmux sessions, launch OMX CLI from shell first instead of treating team as directly available.
   use native Codex subagents for small in-session fanout; use omx team for durable tmux/state/worktree coordination.
+  repo-aware DAG handoff is opt-in: Team only imports a DAG when the invocation matches the latest approved PRD/test-spec launch hint (or a short approved follow-up like \`omx team team\`).
 
 Examples:
   omx team 3:executor "fix failing tests"
   omx team status my-team
   omx team status my-team --json
-  omx team status my-team --tail-lines 600
+  omx team status my-team --model-inspect --tail-lines 600
   omx team api send-message --input '{"team_name":"my-team","from_worker":"worker-1","to_worker":"leader-fixed","body":"ACK"}' --json
 `;
 
@@ -174,6 +311,10 @@ Supported operations:
 Examples:
   omx team api list-tasks --input '{"team_name":"my-team"}' --json
   omx team api claim-task --input '{"team_name":"my-team","task_id":"1","worker":"worker-1","expected_version":1}' --json
+
+Safety:
+  team status prints raw tmux capture commands by default so inspect hints do not spend Spark/model quota.
+  pass --model-inspect to print omx sparkshell summary commands intentionally.
 `;
 
 const HELP_TOKENS = new Set(['--help', '-h', 'help']);
@@ -354,6 +495,14 @@ function parseStatusTailLines(args: string[]): number {
     }
   }
   return DEFAULT_SPARKSHELL_TAIL_LINES;
+}
+
+function parseStatusModelInspect(args: string[]): boolean {
+  return args.includes('--model-inspect');
+}
+
+function rawTmuxCaptureCommand(paneId: string, tailLines: number): string {
+  return `tmux capture-pane -p -t ${paneId} -S -${tailLines}`;
 }
 
 export interface ParsedTeamStartArgs {
@@ -550,7 +699,8 @@ function inspectEntryDescriptors(paneStatus: TeamPaneStatus): InspectEntryDescri
   ];
 }
 
-function formatInspectItemLine(index: number, item: TeamInspectItem): string {
+function formatInspectItemLine(index: number, item: TeamInspectItem, modelInspect = false, tailLines = DEFAULT_SPARKSHELL_TAIL_LINES): string {
+  const command = modelInspect ? item.command : rawTmuxCaptureCommand(item.pane_id, tailLines);
   const parts = [
     `inspect_item_${index + 1}:`,
     `target=${item.target}`,
@@ -618,13 +768,23 @@ function formatInspectItemLine(index: number, item: TeamInspectItem): string {
     item.team_summary_snapshot_path ? `team_summary_snapshot_path=${item.team_summary_snapshot_path}` : '',
     `reason=${item.reason}`,
     item.state ? `state=${item.state}` : '',
-    `command=${item.command}`,
+    `command=${command}`,
   ];
   return parts.filter(Boolean).join(' ');
 }
 
+function renderInspectSummary(summary: string, command: string | null): string {
+  if (!command) return summary;
+  if (/(^| )command=/.test(summary)) {
+    return summary.replace(/(^| )command=.*$/, `$1command=${command}`);
+  }
+  return `${summary} command=${command}`;
+}
+
 function renderTeamPaneStatus(
   paneStatus: TeamPaneStatus,
+  modelInspect = false,
+  tailLines = DEFAULT_SPARKSHELL_TAIL_LINES,
 ): void {
   if (paneStatus.leader_pane_id || paneStatus.hud_pane_id) {
     console.log(`panes: leader=${paneStatus.leader_pane_id || '-'} hud=${paneStatus.hud_pane_id || '-'}`);
@@ -636,7 +796,7 @@ function renderTeamPaneStatus(
   }
 
   if (paneStatus.sparkshell_hint) {
-    console.log('sparkshell_hint: omx sparkshell --tmux-pane <pane-id> --tail-lines 400');
+    console.log('inspect_hint: raw tmux capture commands are quota-free; rerun status with --model-inspect for omx sparkshell summaries');
   }
 
   if (paneStatus.recommended_inspect_targets.length > 0) {
@@ -646,24 +806,40 @@ function renderTeamPaneStatus(
   logInspectEntryDescriptors(inspectEntryDescriptors(paneStatus));
 
   if (paneStatus.recommended_inspect_command) {
-    console.log(`inspect_next: ${paneStatus.recommended_inspect_command}`);
+    const inspectCommand = modelInspect
+      ? paneStatus.recommended_inspect_command
+      : rawTmuxCaptureCommand(paneStatus.recommended_inspect_items[0]?.pane_id ?? '', tailLines);
+    if (inspectCommand.trim().length > 0) console.log(`inspect_next: ${inspectCommand}`);
   }
   if (paneStatus.recommended_inspect_summary) {
-    console.log(`inspect_summary: ${paneStatus.recommended_inspect_summary}`);
+    const summaryCommand = paneStatus.recommended_inspect_command
+      ? modelInspect
+        ? paneStatus.recommended_inspect_command
+        : rawTmuxCaptureCommand(paneStatus.recommended_inspect_items[0]?.pane_id ?? '', tailLines)
+      : null;
+    const summary = renderInspectSummary(paneStatus.recommended_inspect_summary, summaryCommand);
+    console.log(`inspect_summary: ${summary}`);
   }
-  for (const [index, command] of paneStatus.recommended_inspect_commands.entries()) {
+  for (const [index, item] of paneStatus.recommended_inspect_items.entries()) {
+    const command = modelInspect ? item.command : rawTmuxCaptureCommand(item.pane_id, tailLines);
     console.log(`inspect_priority_${index + 1}: ${command}`);
   }
   for (const [index, item] of paneStatus.recommended_inspect_items.entries()) {
-    console.log(formatInspectItemLine(index, item));
+    console.log(formatInspectItemLine(index, item, modelInspect, tailLines));
   }
 
-  for (const [target, command] of Object.entries(paneStatus.sparkshell_commands)) {
+  for (const [target, paneId] of Object.entries({
+    ...(paneStatus.leader_pane_id ? { leader: paneStatus.leader_pane_id } : {}),
+    ...(paneStatus.hud_pane_id ? { hud: paneStatus.hud_pane_id } : {}),
+    ...paneStatus.worker_panes,
+  })) {
+    const modelCommand = paneStatus.sparkshell_commands[target];
+    const command = modelInspect && modelCommand ? modelCommand : rawTmuxCaptureCommand(paneId, tailLines);
     console.log(`inspect_${target}: ${command}`);
   }
 }
 
-function parseTeamArgs(args: string[], cwd: string = process.cwd()): ParsedTeamArgs {
+export function parseTeamArgs(args: string[], cwd: string = process.cwd()): ParsedTeamArgs {
   const tokens = [...args];
   let workerCount = 3;
   let agentType = 'executor';
@@ -708,9 +884,62 @@ function parseTeamArgs(args: string[], cwd: string = process.cwd()): ParsedTeamA
     }
   }
 
+  const explicitApprovedCommand = followupContext == null
+    ? buildExplicitOmxTeamLaunchCommand(
+      effectiveTask,
+      workerCount,
+      explicitWorkerCount,
+      agentType,
+      explicitAgentType,
+    )
+    : null;
+  const exactCommandHintOutcome = explicitApprovedCommand
+    ? readApprovedExecutionLaunchHintOutcome(cwd, 'team', {
+      task: effectiveTask,
+      command: explicitApprovedCommand,
+    })
+    : null;
+  const approvedHintOutcome = followupContext
+    ? null
+    : exactCommandHintOutcome && exactCommandHintOutcome.status !== 'absent'
+      ? exactCommandHintOutcome
+    : readApprovedExecutionLaunchHintOutcome(cwd, 'team', {
+      task: effectiveTask,
+      workerCount,
+      ...(explicitAgentType ? { agentType } : {}),
+      linkedRalph: false,
+    });
+  const approvedHint = followupContext?.approvedHint
+    ?? (approvedHintOutcome?.status === 'resolved' ? approvedHintOutcome.hint : null);
+  const matchesApprovedLaunchHint = followupContext == null
+    && approvedHint?.task.trim() === effectiveTask.trim()
+    && (approvedHint.workerCount == null || approvedHint.workerCount === workerCount)
+    && (approvedHint.agentType == null || approvedHint.agentType === agentType)
+    && Boolean(approvedHint.linkedRalph) === false;
+  const allowRepoAwareDagHandoff = followupContext != null || matchesApprovedLaunchHint;
+  const dagFallbackReason = undefined;
+  const approvedRepositoryContextSummary = allowRepoAwareDagHandoff
+    ? approvedHint?.repositoryContextSummary
+    : undefined;
+
   const teamName = sanitizeTeamName(slugifyTask(effectiveTask));
-  return { workerCount, agentType, explicitAgentType, explicitWorkerCount, task: effectiveTask, teamName };
+  return {
+    workerCount,
+    agentType,
+    explicitAgentType,
+    explicitWorkerCount,
+    task: effectiveTask,
+    teamName,
+    displayName: teamName,
+    allowRepoAwareDagHandoff,
+    ...(dagFallbackReason ? { dagFallbackReason } : {}),
+    ...(approvedRepositoryContextSummary ? { approvedRepositoryContextSummary } : {}),
+    ...(allowRepoAwareDagHandoff && approvedHint
+      ? { approvedExecution: buildApprovedTeamExecutionBinding(approvedHint) }
+      : {}),
+  };
 }
+
 
 export function parseTeamStartArgs(args: string[]): ParsedTeamStartArgs {
   const parsedWorktree = parseWorktreeMode(args);
@@ -1014,6 +1243,7 @@ async function ensureTeamModeState(
       task_description: parsed.task,
       current_phase: currentPhase,
       team_name: parsed.teamName,
+      display_name: parsed.displayName ?? parsed.teamName,
       agent_count: parsed.workerCount,
       agent_types: roleDistribution,
       available_agent_types: availableAgentTypes,
@@ -1029,6 +1259,7 @@ async function ensureTeamModeState(
     active,
     current_phase: currentPhase,
     team_name: parsed.teamName,
+    display_name: parsed.displayName ?? parsed.teamName,
     agent_count: parsed.workerCount,
     agent_types: roleDistribution,
     available_agent_types: availableAgentTypes,
@@ -1099,6 +1330,7 @@ async function persistTeamShutdownModeState(
         explicitAgentType: false,
         explicitWorkerCount: false,
         teamName,
+        allowRepoAwareDagHandoff: false,
       });
     } else {
       await startMode('team', `shutdown team ${teamName}`, 50, cwd);
@@ -1148,6 +1380,7 @@ export function buildLeaderMonitoringHints(teamName: string): string[] {
 
 export async function teamCommand(args: string[], _options: TeamCliOptions = {}): Promise<void> {
   const cwd = process.cwd();
+  const codexHomeOverride = resolveCodexHomeForLaunch(cwd, process.env);
   const parsedWorktree = parseWorktreeMode(args);
   const worktreeMode = resolveDefaultTeamWorktreeMode(parsedWorktree.mode);
   const teamArgs = parsedWorktree.remainingArgs;
@@ -1224,8 +1457,9 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
     const name = teamArgs[1];
     const wantsJson = teamArgs.includes('--json');
     if (!name) throw new Error('Usage: omx team status <team-name> [--json]');
-    await recordLeaderRuntimeActivity(cwd, 'team_status', name);
-    const snapshot = await monitorTeam(name, cwd);
+    const resolvedName = resolveTeamNameForCurrentContext(name, cwd);
+    await recordLeaderRuntimeActivity(cwd, 'team_status', resolvedName);
+    const snapshot = await monitorTeam(resolvedName, cwd);
     if (!snapshot) {
       if (wantsJson) {
         console.log(JSON.stringify({
@@ -1240,8 +1474,17 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
       return;
     }
     const tailLines = parseStatusTailLines(teamArgs.slice(2));
-    const config = await readTeamConfig(name, cwd);
+    const modelInspect = parseStatusModelInspect(teamArgs.slice(2));
+    const config = await readTeamConfig(resolvedName, cwd);
     const paneStatus = await readTeamPaneStatus(config, cwd, snapshot, tailLines);
+    const ultragoalContext = await readPersistedTeamUltragoalContext(
+      resolvedName,
+      config?.leader_cwd ?? cwd,
+      config?.team_state_root ?? undefined,
+    );
+    const ultragoalCheckpointGuidance = ultragoalContext
+      ? buildUltragoalCheckpointGuidance(ultragoalContext)
+      : null;
     if (wantsJson) {
       console.log(JSON.stringify({
         ...buildJsonBase(),
@@ -1268,6 +1511,9 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
         },
         performance: snapshot.performance ?? null,
         panes: paneStatus,
+        ...(ultragoalCheckpointGuidance
+          ? { ultragoal_checkpoint_guidance: ultragoalCheckpointGuidance }
+          : {}),
       }));
       return;
     }
@@ -1288,7 +1534,10 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
         `monitor_perf_ms: total=${snapshot.performance.total_ms} list=${snapshot.performance.list_tasks_ms} workers=${snapshot.performance.worker_scan_ms} mailbox=${snapshot.performance.mailbox_delivery_ms}`
       );
     }
-    renderTeamPaneStatus(paneStatus);
+    for (const line of renderUltragoalCheckpointGuidanceText(ultragoalContext)) {
+      console.log(line);
+    }
+    renderTeamPaneStatus(paneStatus, modelInspect, tailLines);
     return;
   }
 
@@ -1302,7 +1551,8 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
       ? Math.max(1, Number.parseInt(teamArgs[timeoutIdx + 1]!, 10) || 0)
       : 30_000;
     const afterEventId = afterIdx >= 0 ? (teamArgs[afterIdx + 1] || '') : '';
-    const config = await readTeamConfig(name, cwd);
+    const resolvedName = resolveTeamNameForCurrentContext(name, cwd);
+    const config = await readTeamConfig(resolvedName, cwd);
     if (!config) {
       if (wantsJson) {
         console.log(JSON.stringify({ team_name: name, status: 'missing', cursor: afterEventId || '', event: null }));
@@ -1312,9 +1562,9 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
       return;
     }
 
-    const baselineCursor = afterEventId || (await readTeamEvents(name, cwd, { wakeableOnly: true }).then((events) => events.at(-1)?.event_id ?? ''));
-    const snapshot = await monitorTeam(name, cwd);
-    const immediateEvent = await readTeamEvents(name, cwd, {
+    const baselineCursor = afterEventId || (await readTeamEvents(resolvedName, cwd, { wakeableOnly: true }).then((events) => events.at(-1)?.event_id ?? ''));
+    const snapshot = await monitorTeam(resolvedName, cwd);
+    const immediateEvent = await readTeamEvents(resolvedName, cwd, {
       afterEventId: baselineCursor || undefined,
       wakeableOnly: true,
     }).then((events) => events[0]);
@@ -1323,7 +1573,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
       immediateEvent
         ? { status: 'event' as const, cursor: immediateEvent.event_id, event: immediateEvent }
         : snapshot && snapshotHasDeadWorkerStall(snapshot)
-          ? await readTeamEvents(name, cwd, { wakeableOnly: true }).then((events) => {
+          ? await readTeamEvents(resolvedName, cwd, { wakeableOnly: true }).then((events) => {
             const latestWakeableEvent = events.at(-1);
             if (latestWakeableEvent) {
               return {
@@ -1332,12 +1582,12 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
                 event: latestWakeableEvent,
               };
             }
-            const fallbackEvent = buildDeadWorkerAwaitEvent(name, snapshot);
+            const fallbackEvent = buildDeadWorkerAwaitEvent(resolvedName, snapshot);
             return fallbackEvent
               ? { status: 'event' as const, cursor: baselineCursor, event: fallbackEvent }
               : { status: 'timeout' as const, cursor: baselineCursor };
           })
-          : await waitForTeamEvent(name, cwd, {
+          : await waitForTeamEvent(resolvedName, cwd, {
             afterEventId: baselineCursor || undefined,
             timeoutMs,
             pollMs: 100,
@@ -1346,7 +1596,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
 
     if (wantsJson) {
       console.log(JSON.stringify({
-        team_name: sanitizeTeamName(name),
+        team_name: resolvedName,
         status: result.status,
         cursor: result.cursor,
         event: result.event ?? null,
@@ -1361,7 +1611,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
 
     const event = result.event!;
     const context = [
-      `team=${name}`,
+      `team=${resolvedName}`,
       `event=${event.type}`,
       `worker=${event.worker}`,
       event.state ? `state=${event.state}` : '',
@@ -1388,11 +1638,14 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
       explicitAgentType: false,
       explicitWorkerCount: false,
       teamName: runtime.teamName,
+      displayName: runtime.config.display_name ?? runtime.teamName,
+      allowRepoAwareDagHandoff: false,
     });
     const availableAgentTypes = await resolveAvailableAgentTypes(cwd);
     const staffingPlan = buildFollowupStaffingPlan('team', runtime.config.task, availableAgentTypes, {
       workerCount: runtime.config.worker_count,
       fallbackRole: resolveImplicitTeamFallbackRole(runtime.config.agent_type, false),
+      codexHomeOverride,
     });
     await renderStartSummary(runtime, staffingPlan);
     return;
@@ -1403,10 +1656,11 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
     if (!name) throw new Error('Usage: omx team shutdown <team-name> [--force] [--confirm-issues]');
     const force = teamArgs.includes('--force');
     const confirmIssues = teamArgs.includes('--confirm-issues');
-    const configBeforeShutdown = await readTeamConfig(name, cwd);
-    const summary = await shutdownTeam(name, cwd, { force, confirmIssues });
+    const resolvedName = resolveTeamNameForCurrentContext(name, cwd);
+    const configBeforeShutdown = await readTeamConfig(resolvedName, cwd);
+    const summary = await shutdownTeam(resolvedName, cwd, { force, confirmIssues });
     await persistTeamShutdownModeState(
-      name,
+      resolvedName,
       cwd,
       configBeforeShutdown
         ? {
@@ -1430,13 +1684,18 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
   }
 
   const parsed = parseTeamArgs(teamArgs, cwd);
-  const executionPlan = buildTeamExecutionPlan(
-    parsed.task,
-    parsed.workerCount,
-    parsed.agentType,
-    parsed.explicitAgentType,
-    parsed.explicitWorkerCount,
-  );
+  const executionPlan = buildRepoAwareTeamExecutionPlan({
+    task: parsed.task,
+    workerCount: parsed.workerCount,
+    agentType: parsed.agentType,
+    explicitAgentType: parsed.explicitAgentType,
+    explicitWorkerCount: parsed.explicitWorkerCount,
+    cwd,
+    buildLegacyPlan: buildTeamExecutionPlan,
+    allowDagHandoff: parsed.allowRepoAwareDagHandoff,
+    dagFallbackReason: parsed.dagFallbackReason,
+    approvedRepositoryContextSummary: parsed.approvedRepositoryContextSummary,
+  });
   const tasks = executionPlan.tasks;
   const effectiveParsed = executionPlan.workerCount === parsed.workerCount
     ? parsed
@@ -1445,6 +1704,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
   const staffingPlan = buildFollowupStaffingPlan('team', parsed.task, availableAgentTypes, {
     workerCount: executionPlan.workerCount,
     fallbackRole: resolveImplicitTeamFallbackRole(parsed.agentType, parsed.explicitAgentType),
+    codexHomeOverride,
   });
   const runtime = await startTeam(
     parsed.teamName,
@@ -1453,9 +1713,14 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
     executionPlan.workerCount,
     tasks,
     cwd,
-    { worktreeMode },
+    {
+      codexHomeOverride,
+      worktreeMode,
+      decompositionMetadata: executionPlan.metadata,
+      approvedExecution: parsed.approvedExecution ?? null,
+    },
   );
 
-  await ensureTeamModeState(effectiveParsed, tasks);
+  await ensureTeamModeState({ ...effectiveParsed, teamName: runtime.teamName, displayName: runtime.config.display_name ?? effectiveParsed.displayName }, tasks);
   await renderStartSummary(runtime, staffingPlan);
 }

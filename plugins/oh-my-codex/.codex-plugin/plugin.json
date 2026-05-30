@@ -1,6 +1,6 @@
 {
   "name": "oh-my-codex",
-  "version": "0.15.0",
+  "version": "0.18.6",
   "description": "Multi-agent orchestration layer for OpenAI Codex CLI",
   "author": {
     "name": "Yeachan Heo",
@@ -23,8 +23,9 @@
   "interface": {
     "displayName": "oh-my-codex",
     "shortDescription": "Workflow layer and skill bundle for OpenAI Codex CLI.",
-    "longDescription": "Plugin = OMX skill/workflow discovery plus plugin-scoped companion metadata for MCP servers and apps. Setup = runtime wiring; keep npm install plus omx setup for native agents, prompts, config, native .codex/hooks.json coverage, AGENTS.md, HUD, and runtime state.",
+    "longDescription": "Plugin = OMX skill/workflow discovery plus plugin-scoped companion metadata for hooks, MCP servers, and apps. Setup = runtime wiring; legacy setup installs native agents/prompts, while plugin setup enables official plugin-scoped hooks, archives stale legacy native agents/prompts, and keeps config, optional AGENTS.md, HUD, and runtime state current.",
     "developerName": "Yeachan Heo",
     "category": "Developer Tools"
-  }
+  },
+  "hooks": "./hooks/hooks.json"
 }

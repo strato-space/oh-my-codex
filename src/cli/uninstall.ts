@@ -4,15 +4,21 @@
 
 import { readFile, writeFile, readdir, rm } from "fs/promises";
 import { existsSync } from "fs";
-import { join, basename } from "path";
+import { join, basename, dirname } from "path";
 import {
+  formatTomlStringArray,
+  getRootTomlArray,
+  isOmxManagedNotifyCommand,
+  sanitizePreviousNotifyCommand,
   stripExistingOmxBlocks,
   stripOmxEnvSettings,
   stripOmxTopLevelKeys,
   stripOmxFeatureFlags,
+  upsertCodexHooksFeatureFlag,
   stripOmxSeededBehavioralDefaults,
 } from "../config/generator.js";
 import {
+  hasUserCodexHooksAfterManagedRemoval,
   parseCodexHooksConfig,
   removeManagedCodexHooks,
 } from "../config/codex-hooks.js";
@@ -20,11 +26,14 @@ import { getPackageRoot } from "../utils/package.js";
 import { AGENT_DEFINITIONS } from "../agents/definitions.js";
 import { detectLegacySkillRootOverlap } from "../utils/paths.js";
 import { resolveScopeDirectories, type SetupScope } from "./setup.js";
+import { resolveCodexHookFeatureFlagForCli } from "./codex-feature-probe.js";
 import { readPersistedSetupScope } from "./index.js";
 import { isOmxGeneratedAgentsMd } from "../utils/agents-md.js";
 import { OMX_FIRST_PARTY_MCP_SERVER_NAMES } from "../config/omx-first-party-mcp.js";
 
 export interface UninstallOptions {
+  codexFeaturesProbe?: () => string | null;
+  codexVersionProbe?: () => string | null;
   dryRun?: boolean;
   keepConfig?: boolean;
   verbose?: boolean;
@@ -81,7 +90,10 @@ function detectOmxConfigArtifacts(config: string): {
   const hasFeatureFlags =
     /^\s*multi_agent\s*=\s*true/m.test(config) ||
     /^\s*child_agents_md\s*=\s*true/m.test(config) ||
-    /^\s*codex_hooks\s*=\s*true/m.test(config);
+    /^\s*hooks\s*=\s*true/m.test(config) ||
+    /^\s*codex_hooks\s*=\s*true/m.test(config) ||
+    /^\s*goals\s*=\s*true/m.test(config) ||
+    /^\s*goal\s*=\s*true/m.test(config);
   const hasExploreRoutingEnv = /^\s*USE_OMX_EXPLORE_CMD\s*=/m.test(config);
 
   return {
@@ -94,9 +106,99 @@ function detectOmxConfigArtifacts(config: string): {
   };
 }
 
+function hasNativeHooksFeatureFlag(config: string): boolean {
+  const lines = config.split(/\r?\n/);
+  const featuresStart = lines.findIndex((line) =>
+    /^\s*\[features\]\s*$/.test(line),
+  );
+  if (featuresStart < 0) return false;
+
+  let sectionEnd = lines.length;
+  for (let i = featuresStart + 1; i < lines.length; i++) {
+    if (/^\s*\[\[?[^\]]+\]?\]\s*$/.test(lines[i])) {
+      sectionEnd = i;
+      break;
+    }
+  }
+
+  return lines
+    .slice(featuresStart + 1, sectionEnd)
+    .some((line) => /^\s*(?:hooks|codex_hooks)\s*=\s*true/.test(line));
+}
+
+async function shouldPreserveHooksFeatureFlag(
+  hooksFilePath: string,
+): Promise<boolean> {
+  if (!existsSync(hooksFilePath)) return false;
+
+  try {
+    const existing = await readFile(hooksFilePath, "utf-8");
+    return hasUserCodexHooksAfterManagedRemoval(existing);
+  } catch {
+    return false;
+  }
+}
+
+function insertRootTomlKey(config: string, line: string): string {
+  const lines = config.split(/\r?\n/);
+  const firstTableIndex = lines.findIndex((candidate) =>
+    /^\s*\[/.test(candidate),
+  );
+  const insertAt = firstTableIndex >= 0 ? firstTableIndex : lines.length;
+  lines.splice(insertAt, 0, line);
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n");
+}
+
+async function restorePreviousNotifyIfDispatcher(
+  configPath: string,
+  strippedConfig: string,
+  originalConfig: string,
+): Promise<string> {
+  const currentNotify = getRootTomlArray(originalConfig, "notify");
+  if (
+    !isOmxManagedNotifyCommand(currentNotify, getPackageRoot()) ||
+    !currentNotify?.some((part) =>
+      /(?:^|[\\/])notify-dispatcher\.js$/.test(part),
+    )
+  ) {
+    return strippedConfig;
+  }
+
+  const metadataPath = join(dirname(configPath), ".omx", "notify-dispatch.json");
+  try {
+    const metadata = JSON.parse(await readFile(metadataPath, "utf-8")) as {
+      previousNotify?: unknown;
+    };
+    const previousNotify = metadata.previousNotify;
+    if (
+      Array.isArray(previousNotify) &&
+      previousNotify.every((item) => typeof item === "string")
+    ) {
+      const sanitizedPreviousNotify = sanitizePreviousNotifyCommand(
+        previousNotify,
+        getPackageRoot(),
+      );
+      if (sanitizedPreviousNotify) {
+        return insertRootTomlKey(
+          strippedConfig,
+          `notify = ${formatTomlStringArray(sanitizedPreviousNotify)}`,
+        );
+      }
+    }
+  } catch {
+    // Missing or malformed metadata means uninstall falls back to removing OMX notify.
+  }
+  return strippedConfig;
+}
+
 async function cleanConfig(
   configPath: string,
-  options: Pick<UninstallOptions, "dryRun" | "verbose">,
+  options: Pick<
+    UninstallOptions,
+    "dryRun" | "verbose" | "codexFeaturesProbe" | "codexVersionProbe"
+  > & {
+    preserveHooksFeatureFlag?: boolean;
+  },
 ): Promise<
   Pick<
     UninstallSummary,
@@ -124,6 +226,8 @@ async function cleanConfig(
 
   const original = await readFile(configPath, "utf-8");
   const detected = detectOmxConfigArtifacts(original);
+  const shouldRestoreHooksFeatureFlag =
+    options.preserveHooksFeatureFlag && hasNativeHooksFeatureFlag(original);
 
   result.mcpServersRemoved = detected.hasMcpServers;
   result.agentEntriesRemoved = detected.hasAgentEntries;
@@ -136,14 +240,25 @@ async function cleanConfig(
   const { cleaned } = stripExistingOmxBlocks(config);
   config = cleaned;
 
-  // Strip top-level keys
+  // Strip OMX top-level keys, then restore a pre-existing user notify when
+  // setup had wrapped it in the OMX dispatcher.
   config = stripOmxTopLevelKeys(config);
+  config = await restorePreviousNotifyIfDispatcher(configPath, config, original);
 
   // Strip OMX-seeded behavioral defaults only when the seeded pair is unchanged.
   config = stripOmxSeededBehavioralDefaults(config);
 
   // Strip feature flags
   config = stripOmxFeatureFlags(config);
+  if (shouldRestoreHooksFeatureFlag) {
+    config = upsertCodexHooksFeatureFlag(
+      config,
+      resolveCodexHookFeatureFlagForCli({
+        codexFeaturesProbe: options.codexFeaturesProbe,
+        codexVersionProbe: options.codexVersionProbe,
+      }),
+    );
+  }
 
   // Strip OMX-managed env defaults
   config = stripOmxEnvSettings(config);
@@ -388,7 +503,9 @@ function printSummary(summary: UninstallSummary, dryRun: boolean): void {
       );
     }
     if (summary.featureFlagsRemoved) {
-      console.log("    Feature flags (multi_agent, child_agents_md, codex_hooks)");
+      console.log(
+        "    Feature flags (multi_agent, child_agents_md, goals; hooks preserved when user hooks remain)",
+      );
     }
   } else if (!summary.configCleaned && summary.mcpServersRemoved.length === 0) {
     console.log("  config.toml: no OMX entries found (or --keep-config used)");
@@ -474,6 +591,9 @@ export async function uninstall(options: UninstallOptions = {}): Promise<void> {
   };
 
   summary.legacySkillRootWarning = await detectLegacySkillRootWarning(scope);
+  const preserveHooksFeatureFlag = await shouldPreserveHooksFeatureFlag(
+    scopeDirs.codexHooksFile,
+  );
 
   // Step 1: Clean config.toml
   if (keepConfig) {
@@ -483,6 +603,9 @@ export async function uninstall(options: UninstallOptions = {}): Promise<void> {
     const configResult = await cleanConfig(scopeDirs.codexConfigFile, {
       dryRun,
       verbose,
+      preserveHooksFeatureFlag,
+      codexFeaturesProbe: options.codexFeaturesProbe,
+      codexVersionProbe: options.codexVersionProbe,
     });
     Object.assign(summary, configResult);
   }

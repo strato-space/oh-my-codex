@@ -23,8 +23,9 @@
         <span class="badge">GitHub Pages</span>
         <h1>oh-my-codex</h1>
         <p>Multi-agent orchestration for OpenAI Codex CLI.</p>
+        <p><strong>Official project:</strong> <a href="https://github.com/Yeachan-Heo/oh-my-codex">Yeachan-Heo/oh-my-codex</a>. <strong>Official package:</strong> <a href="https://www.npmjs.com/package/oh-my-codex">oh-my-codex</a>. Third-party projects or forks using names such as “OMX v2” are not official continuations or release lines unless these docs explicitly say so.</p>
         <pre><code>npm install -g oh-my-codex</code></pre>
-        <p>Real global version bumps now print an explicit reminder instead of auto-launching <code>omx setup</code>. When you're ready, run <code>omx setup</code> manually or use <code>omx update</code> to check npm and then run the same setup refresh path. Fresh OMX-managed <code>gpt-5.5</code> configs recommend <code>250000 / 200000</code> only when those keys are missing.</p>
+        <p>Real global version bumps now print an explicit reminder instead of auto-launching <code>omx setup</code>. When you're ready, run <code>omx setup</code> manually or use <code>omx update</code> to check npm and then run the same setup refresh path. Launch-time update checks are throttled and prompt by default; set <code>OMX_AUTO_UPDATE=0</code> to disable them or <code>OMX_AUTO_UPDATE=defer</code> to schedule deferred updates without prompting. Fresh OMX-managed <code>gpt-5.5</code> configs recommend <code>250000 / 200000</code> only when those keys are missing.</p>
       </section>
 
       <section aria-labelledby="whats-new-060">
@@ -74,10 +75,18 @@
         <li><code>omx --xhigh --madmax</code> (trusted environments) or <code>omx</code></li>
       </ol>
 
+      <h2>Reference Guides</h2>
+      <ul>
+        <li><a href="./architecture/cli-first-mcp-taxonomy.md">CLI-first MCP taxonomy and recovery matrix</a></li>
+        <li><a href="./reference/omx-config-schema-routing.md">.omx-config.json model/env routing reference</a></li>
+        <li><a href="./pipeline/github-pr-package-identity.md">GitHub / PR / package identity pipeline</a></li>
+      </ul>
+
       <h2>Integration Guides</h2>
       <p>OpenClaw / notification gateway setup and prompt-tuning guides by language:</p>
       <p><a href="./integrations.html">Open dedicated Integrations page</a></p>
       <ul>
+        <li><a href="./discord-integration.md">Discord setup: webhook URL vs bot token</a></li>
         <li><a href="./openclaw-integration.md">English</a></li>
         <li><a href="./openclaw-integration.ko.md">한국어</a></li>
         <li><a href="./openclaw-integration.ja.md">日本語</a></li>

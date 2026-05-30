@@ -13,6 +13,9 @@
  *   "models": {
  *     "default": "o4-mini",
  *     "team": "gpt-4.1"
+ *   },
+ *   "agentReasoning": {
+ *     "architect": "xhigh"
  *   }
  * }
  *
@@ -32,7 +35,10 @@ export interface OmxConfigEnv {
   [key: string]: string | undefined;
 }
 
+export type ConfiguredAgentReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh';
+
 interface OmxConfigFile {
+  agentReasoning?: Record<string, unknown>;
   env?: OmxConfigEnv;
   models?: ModelsConfig;
 }
@@ -47,6 +53,7 @@ export const OMX_DEFAULT_FRONTIER_MODEL_ENV = 'OMX_DEFAULT_FRONTIER_MODEL';
 export const OMX_DEFAULT_STANDARD_MODEL_ENV = 'OMX_DEFAULT_STANDARD_MODEL';
 export const OMX_DEFAULT_SPARK_MODEL_ENV = 'OMX_DEFAULT_SPARK_MODEL';
 export const OMX_SPARK_MODEL_ENV = 'OMX_SPARK_MODEL';
+export const OMX_TEAM_CHILD_MODEL_ENV = 'OMX_TEAM_CHILD_MODEL';
 
 function readOmxConfigFile(codexHomeOverride?: string): OmxConfigFile | null {
   const configPath = join(codexHomeOverride || codexHome(), '.omx-config.json');
@@ -86,11 +93,30 @@ function readModelsBlock(codexHomeOverride?: string): ModelsConfig | null {
 export const DEFAULT_FRONTIER_MODEL = 'gpt-5.5';
 export const DEFAULT_STANDARD_MODEL = 'gpt-5.4-mini';
 export const DEFAULT_SPARK_MODEL = 'gpt-5.3-codex-spark';
+export const DEFAULT_TEAM_CHILD_MODEL = DEFAULT_STANDARD_MODEL;
 
 function normalizeConfiguredValue(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function normalizeAgentReasoningEffort(value: unknown): ConfiguredAgentReasoningEffort | undefined {
+  const normalized = normalizeConfiguredValue(value)?.toLowerCase();
+  if (
+    normalized === 'low' ||
+    normalized === 'medium' ||
+    normalized === 'high' ||
+    normalized === 'xhigh'
+  ) {
+    return normalized;
+  }
+  return undefined;
+}
+
+function normalizeAgentName(value: unknown): string | undefined {
+  const normalized = normalizeConfiguredValue(value)?.toLowerCase();
+  return normalized && /^[a-z0-9][a-z0-9_-]*$/.test(normalized) ? normalized : undefined;
 }
 
 function readConfigEnvValue(key: string, codexHomeOverride?: string): string | undefined {
@@ -125,14 +151,40 @@ export function readConfiguredEnvOverrides(codexHomeOverride?: string): NodeJS.P
   return resolved;
 }
 
+export function readAgentReasoningOverrides(
+  codexHomeOverride?: string,
+): Record<string, ConfiguredAgentReasoningEffort> {
+  const config = readOmxConfigFile(codexHomeOverride);
+  const raw = config?.agentReasoning;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+
+  const resolved: Record<string, ConfiguredAgentReasoningEffort> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    const role = normalizeAgentName(key);
+    const effort = normalizeAgentReasoningEffort(value);
+    if (role && effort) resolved[role] = effort;
+  }
+  return resolved;
+}
+
+export function getAgentReasoningOverride(
+  agentName: string | undefined,
+  codexHomeOverride?: string,
+): ConfiguredAgentReasoningEffort | undefined {
+  const normalized = normalizeAgentName(agentName);
+  if (!normalized) return undefined;
+  return readAgentReasoningOverrides(codexHomeOverride)[normalized];
+}
+
 export function readActiveProviderEnvOverrides(
   env: NodeJS.ProcessEnv = process.env,
   codexHomeOverride?: string,
+  activeProviderOverride?: string,
 ): NodeJS.ProcessEnv {
   const config = readCodexConfigFile(codexHomeOverride);
   if (!config) return {};
 
-  const activeProvider = normalizeConfiguredValue(config.model_provider);
+  const activeProvider = normalizeConfiguredValue(activeProviderOverride) ?? normalizeConfiguredValue(config.model_provider);
   if (!activeProvider) return {};
 
   const providers = config.model_providers;
@@ -164,6 +216,10 @@ function getCodexConfigRootModel(codexHomeOverride?: string): string | undefined
   return normalizeConfiguredValue(readCodexConfigFile(codexHomeOverride)?.model);
 }
 
+export function getCodexConfigRootModelProvider(codexHomeOverride?: string): string | undefined {
+  return normalizeConfiguredValue(readCodexConfigFile(codexHomeOverride)?.model_provider);
+}
+
 export function getEnvConfiguredStandardDefaultModel(
   env: NodeJS.ProcessEnv = process.env,
   codexHomeOverride?: string,
@@ -180,6 +236,13 @@ export function getEnvConfiguredSparkDefaultModel(
     ?? normalizeConfiguredValue(env[OMX_SPARK_MODEL_ENV])
     ?? readConfigEnvValue(OMX_DEFAULT_SPARK_MODEL_ENV, codexHomeOverride)
     ?? readConfigEnvValue(OMX_SPARK_MODEL_ENV, codexHomeOverride);
+}
+
+
+export function getTeamChildModel(codexHomeOverride?: string): string {
+  return normalizeConfiguredValue(process.env[OMX_TEAM_CHILD_MODEL_ENV])
+    ?? readConfigEnvValue(OMX_TEAM_CHILD_MODEL_ENV, codexHomeOverride)
+    ?? DEFAULT_TEAM_CHILD_MODEL;
 }
 
 /**

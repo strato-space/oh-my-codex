@@ -2,6 +2,7 @@ import { execFileSync, type ExecFileSyncOptionsWithStringEncoding } from 'child_
 import { readdir, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { resolveOmxFirstPartyMcpEntrypointForPluginTarget } from '../config/omx-first-party-mcp.js';
 
 const HELP = [
   'Usage: omx cleanup [--dry-run]',
@@ -16,7 +17,8 @@ const HELP = [
 const PROCESS_EXIT_POLL_MS = 100;
 const SIGTERM_GRACE_MS = 5_000;
 const STALE_TMP_MAX_AGE_MS = 60 * 60 * 1000;
-const OMX_MCP_SERVER_PATTERN = /(?:^|[\\/])dist[\\/]mcp[\\/](?:state|memory|code-intel|trace|wiki)-server\.(?:[cm]?js|ts)\b/i;
+const OMX_MCP_ENTRYPOINT_PATTERN = /(?:^|[\\/])dist[\\/]mcp[\\/]((?:state|memory|code-intel|trace|wiki)-server\.(?:[cm]?js|ts))\b/i;
+const OMX_MCP_SERVE_TARGET_PATTERN = /(?:^|\s)mcp-serve\s+([^\s]+)/i;
 const CODEX_PROCESS_PATTERN = /(?:^|[\\/\s])codex(?:\.js)?(?:\s|$)|@openai[\\/]codex/i;
 const OMX_LAUNCH_PROCESS_PATTERN = /(?:^|[\\/\s])omx(?:\.js)?(?:\s|$)|(?:^|[\\/])(?:bin|dist[\\/]cli)[\\/]omx\.js(?:\s|$)|oh-my-codex[\\/]dist[\\/]cli[\\/]omx\.js/i;
 const OMX_TMP_DIRECTORY_PATTERN = /^(omc|omx|oh-my-codex)-/;
@@ -38,7 +40,7 @@ export interface ProcessEntry {
 }
 
 export interface CleanupCandidate extends ProcessEntry {
-  reason: 'ppid=1' | 'outside-current-session';
+  reason: 'ppid=1' | 'outside-current-session' | 'duplicate-sibling';
 }
 
 export interface CleanupResult {
@@ -100,8 +102,16 @@ function formatPlural(count: number, singular: string, plural = `${singular}s`):
 }
 
 export function isOmxMcpProcess(command: string): boolean {
+  return extractOmxMcpEntrypoint(command) !== null;
+}
+
+export function extractOmxMcpEntrypoint(command: string): string | null {
   const normalized = normalizeCommand(command);
-  return OMX_MCP_SERVER_PATTERN.test(normalized);
+  const directEntrypoint = normalized.match(OMX_MCP_ENTRYPOINT_PATTERN)?.[1]?.toLowerCase();
+  if (directEntrypoint) return directEntrypoint;
+
+  const mcpServeTarget = normalized.match(OMX_MCP_SERVE_TARGET_PATTERN)?.[1];
+  return resolveOmxFirstPartyMcpEntrypointForPluginTarget(mcpServeTarget);
 }
 
 export function parsePsOutput(output: string): ProcessEntry[] {
@@ -272,21 +282,56 @@ export function buildProtectedPidSet(
   return protectedPids;
 }
 
+export function findDuplicateSiblingCleanupCandidates(
+  processes: readonly ProcessEntry[],
+): CleanupCandidate[] {
+  const groups = new Map<string, ProcessEntry[]>();
+
+  for (const processEntry of processes) {
+    const entrypoint = extractOmxMcpEntrypoint(processEntry.command);
+    if (!entrypoint) continue;
+    const key = `${processEntry.ppid}:${entrypoint}`;
+    const group = groups.get(key) ?? [];
+    group.push(processEntry);
+    groups.set(key, group);
+  }
+
+  const candidates: CleanupCandidate[] = [];
+  for (const group of groups.values()) {
+    if (group.length <= 1) continue;
+    const sorted = [...group].sort((left, right) => left.pid - right.pid);
+    for (const processEntry of sorted.slice(0, -1)) {
+      candidates.push({
+        ...processEntry,
+        reason: 'duplicate-sibling',
+      });
+    }
+  }
+
+  return candidates.sort((left, right) => left.pid - right.pid);
+}
+
 export function findCleanupCandidates(
   processes: readonly ProcessEntry[],
   currentPid: number,
 ): CleanupCandidate[] {
   const protectedPids = buildProtectedPidSet(processes, currentPid);
+  const duplicateCandidates = findDuplicateSiblingCleanupCandidates(processes)
+    .filter((processEntry) => processEntry.pid !== currentPid);
+  const duplicateCandidatePids = new Set(duplicateCandidates.map((candidate) => candidate.pid));
 
-  return processes
+  const orphanCandidates = processes
     .filter((processEntry) => processEntry.pid !== currentPid)
     .filter((processEntry) => isOmxMcpProcess(processEntry.command))
+    .filter((processEntry) => !duplicateCandidatePids.has(processEntry.pid))
     .filter((processEntry) => !protectedPids.has(processEntry.pid))
-    .sort((left, right) => left.pid - right.pid)
     .map((processEntry) => ({
       ...processEntry,
       reason: processEntry.ppid <= 1 ? 'ppid=1' : 'outside-current-session',
-    }));
+    }) satisfies CleanupCandidate);
+
+  return [...duplicateCandidates, ...orphanCandidates]
+    .sort((left, right) => left.pid - right.pid);
 }
 
 export function findLaunchSafeCleanupCandidates(
@@ -299,6 +344,12 @@ export function findLaunchSafeCleanupCandidates(
 
   return findCleanupCandidates(processes, currentPid).filter((candidate) => {
     if (candidate.ppid <= 1) return true;
+
+    // Launch-safe cleanup runs automatically before starting Codex/OMX work.
+    // Preserve every MCP process still attached to a live Codex or OMX launch
+    // ancestor, including older same-parent duplicate siblings. Destructive
+    // duplicate-sibling reaping remains available through manual cleanup via
+    // findCleanupCandidates/default cleanupOmxMcpProcesses selection.
     return (
       !hasAncestorMatching(processByPid, candidate.pid, isCodexSessionProcess) &&
       !hasAncestorMatching(processByPid, candidate.pid, isOmxLaunchProcess)

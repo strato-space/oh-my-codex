@@ -1,18 +1,28 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { mkdtemp, readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   analyzeDuplicateSiblingState,
   MCP_ENTRYPOINT_MARKER_ENV,
   extractMcpEntrypointMarker,
   isParentProcessAlive,
+  listProcessTable,
   parseProcessTable,
+  parseWindowsProcessTable,
   resolveCurrentMcpEntrypointMarker,
+  resolveDuplicateSiblingWatchdogInitialDelayMs,
   shouldAutoStartMcpServer,
   shouldSelfExitForDuplicateSibling,
+  shouldSelfExitForPreTrafficSiblingHardCap,
   type McpServerName,
 } from '../bootstrap.js';
+import {
+  resolveMcpLifecycleLogDir,
+  resolveMcpLifecycleLogFile,
+  writeMcpLifecycleTelemetry,
+} from '../lifecycle-telemetry.js';
 
 const ALL_SERVERS: readonly McpServerName[] = [
   'state',
@@ -20,6 +30,7 @@ const ALL_SERVERS: readonly McpServerName[] = [
   'code_intel',
   'trace',
   'wiki',
+  'hermes',
 ] as const;
 
 const SERVER_DISABLE_ENV: Record<McpServerName, string> = {
@@ -28,6 +39,7 @@ const SERVER_DISABLE_ENV: Record<McpServerName, string> = {
   code_intel: 'OMX_CODE_INTEL_SERVER_DISABLE_AUTO_START',
   trace: 'OMX_TRACE_SERVER_DISABLE_AUTO_START',
   wiki: 'OMX_WIKI_SERVER_DISABLE_AUTO_START',
+  hermes: 'OMX_HERMES_SERVER_DISABLE_AUTO_START',
 };
 
 const SERVER_ENTRYPOINTS: Array<{ server: McpServerName; file: string }> = [
@@ -36,6 +48,7 @@ const SERVER_ENTRYPOINTS: Array<{ server: McpServerName; file: string }> = [
   { server: 'code_intel', file: 'src/mcp/code-intel-server.ts' },
   { server: 'trace', file: 'src/mcp/trace-server.ts' },
   { server: 'wiki', file: 'src/mcp/wiki-server.ts' },
+  { server: 'hermes', file: 'src/mcp/hermes-server.ts' },
 ];
 
 describe('mcp bootstrap auto-start guard', () => {
@@ -89,6 +102,24 @@ describe('mcp parent watchdog liveness checks', () => {
 });
 
 describe('mcp shared stdio lifecycle contract', () => {
+  it('keeps server connection immediate and duplicate process-table scans delayed', async () => {
+    const src = await readFile(join(process.cwd(), 'src/mcp/bootstrap.ts'), 'utf8');
+    const connectIndex = src.indexOf('server.connect(transport)');
+    const duplicateDelayIndex = src.indexOf('duplicateSiblingInitialDelayTimer = setTimeout');
+
+    assert.ok(connectIndex > 0, 'bootstrap should still connect the MCP transport');
+    assert.ok(duplicateDelayIndex > 0, 'bootstrap should delay duplicate-sibling process scans');
+    assert.ok(
+      connectIndex > duplicateDelayIndex,
+      'duplicate-sibling scan delay must not wrap or delay server.connect',
+    );
+    assert.match(
+      src,
+      /const transport = new StdioServerTransport\(\);/,
+      'transport construction should remain eager',
+    );
+  });
+
   it('keeps shared stdio lifecycle wiring in bootstrap', async () => {
     const src = await readFile(join(process.cwd(), 'src/mcp/bootstrap.ts'), 'utf8');
 
@@ -128,6 +159,41 @@ describe('mcp shared stdio lifecycle contract', () => {
 });
 
 describe('mcp duplicate sibling detection', () => {
+  it('resolves deterministic bounded initial duplicate scan delays', () => {
+    const stateDelay = resolveDuplicateSiblingWatchdogInitialDelayMs(
+      'state',
+      'state-server.js',
+      { duplicateSiblingInitialDelayMs: null, duplicateSiblingInitialDelayMaxMs: 1000 },
+    );
+    const memoryDelay = resolveDuplicateSiblingWatchdogInitialDelayMs(
+      'memory',
+      'memory-server.js',
+      { duplicateSiblingInitialDelayMs: null, duplicateSiblingInitialDelayMaxMs: 1000 },
+    );
+
+    assert.equal(
+      stateDelay,
+      resolveDuplicateSiblingWatchdogInitialDelayMs(
+        'state',
+        'state-server.js',
+        { duplicateSiblingInitialDelayMs: null, duplicateSiblingInitialDelayMaxMs: 1000 },
+      ),
+      'delay should be stable for a server/entrypoint',
+    );
+    assert.ok(stateDelay >= 0 && stateDelay <= 1000);
+    assert.ok(memoryDelay >= 0 && memoryDelay <= 1000);
+    assert.notEqual(stateDelay, memoryDelay, 'first-party servers should be staggered by default');
+    assert.equal(
+      resolveDuplicateSiblingWatchdogInitialDelayMs(
+        'state',
+        'state-server.js',
+        { duplicateSiblingInitialDelayMs: 0, duplicateSiblingInitialDelayMaxMs: 1000 },
+      ),
+      0,
+      'explicit zero delay should remain available for tests/operators',
+    );
+  });
+
   it('extracts same-entrypoint markers from command lines', () => {
     assert.equal(
       extractMcpEntrypointMarker('node /tmp/oh-my-codex/dist/mcp/state-server.js'),
@@ -170,6 +236,112 @@ describe('mcp duplicate sibling detection', () => {
     assert.deepEqual(
       parseProcessTable('101 55 node /tmp/dist/mcp/state-server.js\n'),
       [{ pid: 101, ppid: 55, command: 'node /tmp/dist/mcp/state-server.js' }],
+    );
+  });
+
+  it('parses PowerShell CIM process JSON arrays for Windows process tables', () => {
+    assert.deepEqual(
+      parseWindowsProcessTable(JSON.stringify([
+        {
+          ProcessId: 101,
+          ParentProcessId: 55,
+          CommandLine: 'node C:\\tmp\\dist\\mcp\\state-server.js',
+          Name: 'node.exe',
+        },
+        {
+          ProcessId: '140',
+          ParentProcessId: '55',
+          CommandLine: 'node C:\\tmp\\dist\\mcp\\state-server.js',
+          Name: 'node.exe',
+        },
+      ])),
+      [
+        { pid: 101, ppid: 55, command: 'node C:\\tmp\\dist\\mcp\\state-server.js' },
+        { pid: 140, ppid: 55, command: 'node C:\\tmp\\dist\\mcp\\state-server.js' },
+      ],
+    );
+  });
+
+  it('parses single-object PowerShell CIM JSON from one Windows process', () => {
+    assert.deepEqual(
+      parseWindowsProcessTable(JSON.stringify({
+        ProcessId: 101,
+        ParentProcessId: 55,
+        CommandLine: 'node C:\\tmp\\dist\\mcp\\state-server.js',
+      })),
+      [{ pid: 101, ppid: 55, command: 'node C:\\tmp\\dist\\mcp\\state-server.js' }],
+    );
+  });
+
+  it('treats invalid Windows process-table JSON as unavailable', () => {
+    assert.equal(parseWindowsProcessTable('not json'), null);
+  });
+
+  it('uses bounded PowerShell CIM lookup on Windows and falls back to null on failure', () => {
+    const calls: Array<{
+      command: string;
+      args: readonly string[];
+      options: { timeout?: number; maxBuffer?: number };
+    }> = [];
+    const readWindowsProcessTable = (
+      command: string,
+      args: readonly string[] = [],
+      options: { timeout?: number; maxBuffer?: number } = {},
+    ): string => {
+      calls.push({ command, args, options });
+      return JSON.stringify({
+        ProcessId: 101,
+        ParentProcessId: 55,
+        CommandLine: 'node C:\\tmp\\dist\\mcp\\state-server.js',
+      });
+    };
+
+    assert.deepEqual(
+      listProcessTable(
+        readWindowsProcessTable as typeof import('node:child_process').execFileSync,
+        'win32',
+      ),
+      [{ pid: 101, ppid: 55, command: 'node C:\\tmp\\dist\\mcp\\state-server.js' }],
+    );
+    assert.equal(calls[0]?.command, 'powershell.exe');
+    assert.deepEqual(calls[0]?.args.slice(0, 4), [
+      '-NoProfile',
+      '-NonInteractive',
+      '-ExecutionPolicy',
+      'Bypass',
+    ]);
+    assert.ok(calls[0]?.args.includes('Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,Name | ConvertTo-Json -Compress'));
+    assert.equal(calls[0]?.options.timeout, 2_000);
+    assert.equal(calls[0]?.options.maxBuffer, 4 * 1024 * 1024);
+
+    const failingRead = (() => {
+      throw new Error('powershell unavailable');
+    }) as typeof import('node:child_process').execFileSync;
+    assert.equal(listProcessTable(failingRead, 'win32'), null);
+  });
+
+  it('detects duplicate Windows siblings through the process-table watchdog path', () => {
+    const processes = parseWindowsProcessTable(JSON.stringify([
+      {
+        ProcessId: 101,
+        ParentProcessId: 55,
+        CommandLine: 'node C:\\tmp\\dist\\mcp\\state-server.js',
+      },
+      {
+        ProcessId: 140,
+        ParentProcessId: 55,
+        CommandLine: 'node C:\\tmp\\dist\\mcp\\state-server.js',
+      },
+    ]));
+
+    assert.ok(processes, 'Windows process table should parse');
+    const older = analyzeDuplicateSiblingState(processes, 101, 55, 'state-server.js');
+
+    assert.equal(older.status, 'older_duplicate');
+    assert.deepEqual(older.newerSiblingPids, [140]);
+    assert.equal(
+      shouldSelfExitForDuplicateSibling(older, 11_100, 9_000, null),
+      true,
     );
   });
 
@@ -251,7 +423,7 @@ describe('mcp duplicate sibling detection', () => {
     );
   });
 
-  it('does not self-exit after post-duplicate traffic until the duplicate has remained safely idle long enough', () => {
+  it('lets post-traffic older duplicates self-exit only after the conservative idle window', () => {
     const observation = {
       status: 'older_duplicate' as const,
       entrypoint: 'state-server.js',
@@ -269,7 +441,7 @@ describe('mcp duplicate sibling detection', () => {
     );
   });
 
-  it('uses the duplicate grace window when last traffic predates duplicate observation', () => {
+  it('keeps an already-initialized older sibling alive when last traffic predates duplicate observation', () => {
     const observation = {
       status: 'older_duplicate' as const,
       entrypoint: 'state-server.js',
@@ -283,6 +455,36 @@ describe('mcp duplicate sibling detection', () => {
     );
     assert.equal(
       shouldSelfExitForDuplicateSibling(observation, 11_100, 9_000, 1_000),
+      false,
+    );
+    assert.equal(
+      shouldSelfExitForDuplicateSibling(observation, 70_000, 9_000, 1_000),
+      true,
+    );
+  });
+
+  it('uses the later of duplicate observation and last traffic for post-traffic idle', () => {
+    const observation = {
+      status: 'older_duplicate' as const,
+      entrypoint: 'state-server.js',
+      matchingPids: [101, 140],
+      newerSiblingPids: [140],
+    };
+
+    assert.equal(
+      shouldSelfExitForDuplicateSibling(observation, 13_999, 10_000, 12_000, 1_000, 2_000),
+      false,
+    );
+    assert.equal(
+      shouldSelfExitForDuplicateSibling(observation, 14_000, 10_000, 12_000, 1_000, 2_000),
+      true,
+    );
+    assert.equal(
+      shouldSelfExitForDuplicateSibling(observation, 13_999, 12_000, 10_000, 1_000, 2_000),
+      false,
+    );
+    assert.equal(
+      shouldSelfExitForDuplicateSibling(observation, 14_000, 12_000, 10_000, 1_000, 2_000),
       true,
     );
   });
@@ -328,5 +530,76 @@ describe('mcp duplicate sibling detection', () => {
       shouldSelfExitForDuplicateSibling(missingSelf, 50_000, 10_000, null),
       false,
     );
+  });
+
+  it('hard-caps only never-owned pre-traffic older duplicates', () => {
+    const processes = [
+      { pid: 101, ppid: 55, command: 'node /tmp/dist/mcp/state-server.js' },
+      { pid: 102, ppid: 55, command: 'node /tmp/dist/mcp/state-server.js' },
+      { pid: 103, ppid: 55, command: 'node /tmp/dist/mcp/state-server.js' },
+      { pid: 104, ppid: 55, command: 'node /tmp/dist/mcp/state-server.js' },
+      { pid: 105, ppid: 55, command: 'node /tmp/dist/mcp/state-server.js' },
+    ];
+
+    const oldest = analyzeDuplicateSiblingState(processes, 101, 55, 'state-server.js');
+    const secondOldest = analyzeDuplicateSiblingState(processes, 102, 55, 'state-server.js');
+
+    assert.equal(shouldSelfExitForPreTrafficSiblingHardCap(oldest, null, 4), true);
+    assert.equal(
+      shouldSelfExitForPreTrafficSiblingHardCap(secondOldest, null, 4),
+      false,
+      'newest four pre-traffic siblings stay available',
+    );
+    assert.equal(
+      shouldSelfExitForPreTrafficSiblingHardCap(oldest, 1_000, 4),
+      false,
+      'hard cap must never kill a transport that has seen traffic',
+    );
+    assert.equal(
+      shouldSelfExitForPreTrafficSiblingHardCap(oldest, null, 0),
+      false,
+      'zero disables the hard cap',
+    );
+  });
+});
+
+describe('mcp lifecycle telemetry diagnostics', () => {
+  it('resolves platform log directories and honors the disable switch', () => {
+    assert.equal(
+      resolveMcpLifecycleLogDir({ OMX_MCP_LIFECYCLE_LOG: 'off' }, '/home/test', 'linux'),
+      null,
+    );
+    assert.equal(
+      resolveMcpLifecycleLogDir({ XDG_STATE_HOME: '/state' }, '/home/test', 'linux'),
+      join('/state', 'oh-my-codex', 'mcp'),
+    );
+    assert.equal(
+      resolveMcpLifecycleLogDir({}, '/Users/test', 'darwin'),
+      join('/Users/test', 'Library', 'Logs', 'oh-my-codex', 'mcp'),
+    );
+  });
+
+  it('writes bounded JSONL lifecycle diagnostics outside the repo cwd', async () => {
+    const logDir = await mkdtemp(join(tmpdir(), 'omx-mcp-lifecycle-'));
+    const env = { OMX_MCP_LIFECYCLE_LOG_DIR: logDir };
+
+    writeMcpLifecycleTelemetry({
+      event: 'marker_resolution_failed',
+      server: 'state',
+      entrypoint: 'state-server.js',
+      pid: 123,
+      ppid: 55,
+      argv1: '/opt/homebrew/bin/omx',
+    }, env);
+
+    const file = resolveMcpLifecycleLogFile('state', 'state-server.js', env);
+    assert.equal(file, join(logDir, 'state-server.js.ndjson'));
+    const lines = (await readFile(file!, 'utf8')).trim().split(/\r?\n/);
+    assert.equal(lines.length, 1);
+    const event = JSON.parse(lines[0]);
+    assert.equal(event.event, 'marker_resolution_failed');
+    assert.equal(event.server, 'state');
+    assert.equal(event.entrypoint, 'state-server.js');
+    assert.equal(event.argv1, '/opt/homebrew/bin/omx');
   });
 });

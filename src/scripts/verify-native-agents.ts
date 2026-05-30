@@ -188,7 +188,9 @@ export async function verifyNativeAgents(
     const promptContent = options.promptNames
       ? `${name} prompt fixture`
       : await readFile(promptPath, "utf-8");
-    const toml = generateAgentToml(agent, promptContent);
+    const toml = generateAgentToml(agent, promptContent, {
+      codexHomeOverride: join(root, ".omx", "verify-native-agents-codex-home"),
+    });
     assertTomlStructure(name, agent, toml);
   }
 
@@ -197,11 +199,11 @@ export async function verifyNativeAgents(
       ? await readPluginManifest(root)
       : options.pluginManifest;
   if (pluginManifest) {
-    for (const field of ["agents", "prompts", "hooks"]) {
+    for (const field of ["agents", "prompts"]) {
       if (pluginManifest[field] !== undefined) {
         throw errorBlock("native_agent_plugin_boundary_violation", {
           field,
-          message: "native agents/prompts/hooks are setup-owned, not plugin-scoped",
+          message: "native agents/prompts are setup-owned, not plugin-scoped",
         });
       }
     }

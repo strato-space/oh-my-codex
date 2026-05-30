@@ -15,12 +15,12 @@ This skill activates when:
 - After implementing a major feature
 - User wants quality assessment
 
-## GPT-5.4 Guidance Alignment
+## GPT-5.5 Guidance Alignment
 
-- Default to concise, evidence-dense progress and completion reporting unless the user or risk level requires more detail.
+- Default to outcome-first progress and completion reporting: state the target result, evidence, validation status, and stop condition before adding process detail.
 - Treat newer user task updates as local overrides for the active workflow branch while preserving earlier non-conflicting constraints.
-- If correctness depends on additional inspection, retrieval, execution, or verification, keep using the relevant tools until the review is grounded.
-- Continue through clear, low-risk, reversible next steps automatically; ask only when the next step is materially branching, destructive, or preference-dependent.
+- If correctness depends on additional inspection, retrieval, execution, or verification, keep using the relevant tools until the review is grounded; stop once enough evidence exists.
+- Continue through clear, low-risk, reversible next steps automatically; ask only when the next step is materially branching, destructive, credentialed, external-production, or preference-dependent.
 
 Delegates to the `code-reviewer` and `architect` agents in parallel for a two-lane review:
 
@@ -32,6 +32,7 @@ Delegates to the `code-reviewer` and `architect` agents in parallel for a two-la
    - **`code-reviewer` lane** - owns spec compliance, security, code quality, performance, and maintainability findings
    - **`architect` lane** - owns the devil's-advocate / design-tradeoff perspective
    - Both lanes run in parallel and produce distinct outputs before final synthesis
+   - If either lane cannot be launched or does not return evidence, report `independent review unavailable`; do **not** substitute the current/authoring lane, and do **not** approve or mark the review merge-ready.
 
 3. **Review Categories**
    - **Security** - Hardcoded secrets, injection risks, XSS, CSRF
@@ -58,6 +59,7 @@ Delegates to the `code-reviewer` and `architect` agents in parallel for a two-la
 
 7. **Final Synthesis**
    - Combine the `code-reviewer` recommendation and the architect status into one final verdict
+   - Approval requires explicit evidence from both independent lanes; missing or failed delegation is a blocking unavailable-review state, not an approval fallback
    - Deterministic merge gating rules:
      - If architect status is **BLOCK**, final recommendation is **REQUEST CHANGES**
      - Else if `code-reviewer` recommendation is **REQUEST CHANGES**, final recommendation is **REQUEST CHANGES**
@@ -66,6 +68,8 @@ Delegates to the `code-reviewer` and `architect` agents in parallel for a two-la
    - The final report must make architect blockers impossible to miss
 
 ## Agent Delegation
+
+Do not self-review as a fallback. If the `code-reviewer` or `architect` agent path is missing, unavailable, skipped, or fails, emit a clear unavailable-review result and block approval until the independent lane evidence exists.
 
 ```
 delegate(
@@ -126,7 +130,7 @@ The code-reviewer agent SHOULD consult Codex for cross-validation.
 1. **Form your OWN review FIRST** - Complete the review independently
 2. **Consult for validation** - Cross-check findings with Codex
 3. **Critically evaluate** - Never blindly adopt external findings
-4. **Graceful fallback** - Never block if tools unavailable
+4. **Graceful optional consultation fallback** - Never block because optional external consultation tools are unavailable; this does not waive the required independent `code-reviewer` and `architect` lanes
 
 ### When to Consult
 - Security-sensitive code changes
@@ -141,9 +145,7 @@ The code-reviewer agent SHOULD consult Codex for cross-validation.
 - Small, isolated changes
 
 ### Tool Usage
-Before first MCP tool use, call `ToolSearch("mcp")` to discover deferred MCP tools.
-Use `mcp__x__ask_codex` with `agent_role: "code-reviewer"`.
-If ToolSearch finds no MCP tools, fall back to the `code-reviewer` agent.
+Prefer native `code-reviewer` agent consultation or CLI-backed `ask_codex` surfaces when available. Optional MCP compatibility ask tools may be used only when already enabled. If optional external consultation tools are unavailable, continue with the required independent `code-reviewer` and `architect` lanes; do not replace those lanes with self-review.
 
 **Note:** Codex calls can take up to 1 hour. Consider the review timeline before consulting.
 
@@ -248,8 +250,8 @@ The `architect` lane checks:
 
 ## Approval Criteria
 
-**APPROVE** - `code-reviewer` returns APPROVE and architect status is `CLEAR`
-**REQUEST CHANGES** - `code-reviewer` returns REQUEST CHANGES or architect status is `BLOCK`
+**APPROVE** - `code-reviewer` returns APPROVE, architect status is `CLEAR`, and both independent lanes returned evidence
+**REQUEST CHANGES** - `code-reviewer` returns REQUEST CHANGES, architect status is `BLOCK`, or required independent review delegation is unavailable/skipped/failed
 **COMMENT** - `code-reviewer` returns COMMENT with architect status `CLEAR`, architect status is `WATCH`, or only LOW/MEDIUM improvements remain
 
 

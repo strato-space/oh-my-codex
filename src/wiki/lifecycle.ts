@@ -4,10 +4,11 @@
 
 import { existsSync, readFileSync, statSync } from 'fs';
 import { join } from 'path';
-import { codexHome, omxProjectMemoryPath } from '../utils/paths.js';
+import { codexHome, resolveProjectMemoryPath } from '../utils/paths.js';
 import {
   appendLogUnsafe,
   getWikiDir,
+  isLegacyWikiFallbackActive,
   listPages,
   readAllPages,
   readIndex,
@@ -42,13 +43,23 @@ export function onSessionStart(data: { cwd?: string }): { additionalContext?: st
     const config = loadWikiConfig(root);
     if (!config.enabled) return {};
 
+    const legacyFallbackActive = isLegacyWikiFallbackActive(root);
     const wikiDir = getWikiDir(root);
-    if (!existsSync(wikiDir)) return {};
+    if (!existsSync(wikiDir) && !legacyFallbackActive) return {};
 
     const pages = listPages(root);
     if (pages.length === 0) return {};
 
-    if (!readIndex(root)) {
+    if (legacyFallbackActive) {
+      const summary = [
+        `[OMX Wiki: ${pages.length} legacy pages at .omx/wiki/; canonical storage is omx_wiki/]`,
+        '',
+        'Legacy wiki fallback is read-only. Review and copy selected pages into omx_wiki/ before committing.',
+      ].join('\n');
+      return { additionalContext: summary };
+    }
+
+    if (!legacyFallbackActive && !readIndex(root)) {
       withWikiLock(root, () => {
         updateIndexUnsafe(root);
       });
@@ -62,7 +73,7 @@ export function onSessionStart(data: { cwd?: string }): { additionalContext?: st
     if (!index) return {};
 
     const summary = [
-      `[OMX Wiki: ${pages.length} pages at .omx/wiki/]`,
+      `[OMX Wiki: ${pages.length} pages at omx_wiki/]`,
       '',
       'Use wiki_query to search, wiki_list to browse, wiki_read to inspect pages.',
       '',
@@ -155,10 +166,29 @@ export function onPreCompact(data: { cwd?: string }): { additionalContext?: stri
   }
 }
 
+
+export function onPostCompact(data: { cwd?: string }): { additionalContext?: string } {
+  try {
+    const root = data.cwd || process.cwd();
+    const config = loadWikiConfig(root);
+    if (!config.enabled) return {};
+
+    return {
+      additionalContext: [
+        '[OMX Wiki PostCompact Nudge]',
+        'Review the compaction artifacts and write durable findings to repository `omx_wiki/` when they would help future agents.',
+        'Use `omx wiki wiki_ingest --input <json> --json` or `omx wiki wiki_add --input <json> --json` for decisions, architecture notes, debugging findings, environment facts, and session-log summaries worth committing.',
+      ].join('\n'),
+    };
+  } catch {
+    return {};
+  }
+}
+
 function feedProjectMemory(root: string): void {
   try {
-    const projectMemoryPath = omxProjectMemoryPath(root);
-    if (!existsSync(projectMemoryPath)) return;
+    const projectMemoryPath = resolveProjectMemoryPath(root);
+    if (!projectMemoryPath || !existsSync(projectMemoryPath)) return;
 
     const parsed = JSON.parse(readFileSync(projectMemoryPath, 'utf8')) as Record<string, unknown>;
     const existing = readPage(root, 'environment.md');

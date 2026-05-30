@@ -20,7 +20,8 @@
 
 import { writeFile, appendFile, mkdir, readFile } from 'fs/promises';
 import { existsSync } from 'fs';
-import { dirname, join } from 'path';
+import { dirname, join, resolve } from 'path';
+import { isSessionStateUsable } from '../hooks/session.js';
 
 import { safeString, asNumber } from './notify-hook/utils.js';
 import {
@@ -28,6 +29,7 @@ import {
   getQuotaUsage,
   normalizeInputMessages,
 } from './notify-hook/payload-parser.js';
+import { getBaseStateDir } from '../mcp/state-paths.js';
 import {
   getScopedStatePath,
   readCurrentSessionId,
@@ -65,6 +67,12 @@ import {
   maybeNotifyLeaderWorkerIdle,
 } from './notify-hook/team-worker.js';
 import { DEFAULT_MARKER } from './tmux-hook-engine.js';
+import { sameFilePath } from '../utils/paths.js';
+import {
+  MAX_NOTIFY_ARGV_JSON_BYTES,
+  extractRawJsonStringField,
+  utf8ByteLength,
+} from './hook-payload-guard.js';
 
 const RALPH_ACTIVE_PROGRESS_PHASES = new Set([
   'start',
@@ -81,6 +89,117 @@ const RALPH_ACTIVE_PROGRESS_PHASES = new Set([
 ]);
 
 const IDLE_NOTIFICATION_SUMMARY_MAX_LENGTH = 240;
+
+async function readJsonFileIfObject(path: string): Promise<Record<string, unknown> | null> {
+  try {
+    const raw = await readFile(path, 'utf-8');
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function hasOmxRuntimeStateMarker(value: Record<string, unknown> | null): boolean {
+  if (!value) return false;
+  return typeof value.active === 'boolean'
+    || typeof value.team_name === 'string'
+    || typeof value.current_phase === 'string'
+    || typeof value.lifecycle_outcome === 'string'
+    || typeof value.run_outcome === 'string';
+}
+
+async function hasManagedTeamStateTree(cwd: string): Promise<boolean> {
+  const teamStateRoot = join(cwd, '.omx', 'state', 'team');
+  if (!existsSync(teamStateRoot)) return false;
+  let entries: string[] = [];
+  try {
+    entries = await readdir(teamStateRoot);
+  } catch {
+    return false;
+  }
+  for (const entry of entries) {
+    if (entry.startsWith('.')) continue;
+    const teamDir = join(teamStateRoot, entry);
+    if (existsSync(join(teamDir, 'manifest.v2.json')) || existsSync(join(teamDir, 'config.json'))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function isOmxManagedCwd(cwd: string): Promise<boolean> {
+  const trustedInternalCwd = safeString(process.env.OMX_NOTIFY_HOOK_TRUSTED_MANAGED_CWD || '').trim();
+  if (trustedInternalCwd && sameFilePath(trustedInternalCwd, cwd)) return true;
+  if (existsSync(join(cwd, '.omx', 'setup-scope.json'))) return true;
+  if (existsSync(join(cwd, '.omx', 'managed'))) return true;
+  const sessionStatePath = join(cwd, '.omx', 'state', 'session.json');
+  if (existsSync(sessionStatePath)) {
+    try {
+      const sessionState = JSON.parse(await readFile(sessionStatePath, 'utf-8'));
+      if (isSessionStateUsable(sessionState, cwd)) return true;
+    } catch {
+      // Continue checking other managed markers.
+    }
+  }
+  const teamState = await readJsonFileIfObject(join(cwd, '.omx', 'state', 'team-state.json'));
+  if (hasOmxRuntimeStateMarker(teamState)) return true;
+  const hudState = await readJsonFileIfObject(join(cwd, '.omx', 'state', 'hud-state.json'));
+  if (hudState && (typeof hudState.last_turn_at === 'string' || typeof hudState.turn_count === 'number')) return true;
+  if (await hasManagedTeamStateTree(cwd)) return true;
+  const teamWorkerEnv = safeString(process.env.OMX_TEAM_INTERNAL_WORKER || process.env.OMX_TEAM_WORKER || '').trim();
+  if (teamWorkerEnv) {
+    const [teamName = '', workerName = ''] = teamWorkerEnv.split('/');
+    if (teamName && workerName) {
+      const candidateStateRoots = [
+        safeString(process.env.OMX_TEAM_STATE_ROOT || '').trim(),
+        safeString(process.env.OMX_TEAM_LEADER_CWD || '').trim()
+          ? join(resolve(cwd, safeString(process.env.OMX_TEAM_LEADER_CWD || '').trim()), '.omx', 'state')
+          : '',
+        join(cwd, '.omx', 'state'),
+      ].filter((value, index, values) => value && values.indexOf(value) === index);
+      for (const candidateStateRoot of candidateStateRoots) {
+        const identityPath = join(candidateStateRoot, 'team', teamName, 'workers', workerName, 'identity.json');
+        if (!existsSync(identityPath)) continue;
+        try {
+          const raw = await readFile(identityPath, 'utf-8');
+          const identity = JSON.parse(raw);
+          const worktreePath = safeString(identity?.worktree_path || '').trim();
+          const stateRoot = safeString(identity?.team_state_root || '').trim();
+          if (
+            (!worktreePath || sameFilePath(worktreePath, cwd))
+            && (!stateRoot || sameFilePath(stateRoot, candidateStateRoot))
+          ) {
+            return true;
+          }
+        } catch {
+          return false;
+        }
+      }
+      // A worker notify hook with an explicit runtime root hint is OMX-scoped
+      // even when the hint fails validation. Let the main worker path log the
+      // unresolved-root warning and fail closed without inventing local state.
+      if (
+        safeString(process.env.OMX_TEAM_STATE_ROOT || '').trim()
+        || safeString(process.env.OMX_TEAM_LEADER_CWD || '').trim()
+      ) {
+        return true;
+      }
+    }
+  }
+  const hooksPath = join(cwd, '.codex', 'hooks.json');
+  if (existsSync(hooksPath)) {
+    try {
+      const raw = await readFile(hooksPath, 'utf-8');
+      return /(?:^|[\\/])codex-native-hook\.js(?:["'\s]|$)/.test(raw);
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
 
 function summarizeIdleNotificationMessage(message: unknown): string {
   const source = safeString(message)
@@ -158,9 +277,20 @@ function isTurnCompletePayload(payload: Record<string, unknown>): boolean {
   return type === '' || type === 'agent-turn-complete' || type === 'turn-complete';
 }
 
+function isNotifyFallbackTaskCompletePayload(payload: Record<string, unknown>): boolean {
+  const source = safeString(payload.source || '').trim();
+  if (source !== 'notify-fallback-watcher') return false;
+  return normalizeInputMessages(payload).some((message) => (
+    message.includes('[notify-fallback] synthesized from rollout task_complete')
+  ));
+}
+
 async function main() {
   const rawPayload = process.argv[process.argv.length - 1];
   if (!rawPayload || rawPayload.startsWith('-')) {
+    process.exit(0);
+  }
+  if (utf8ByteLength(rawPayload) > MAX_NOTIFY_ARGV_JSON_BYTES) {
     process.exit(0);
   }
 
@@ -172,20 +302,26 @@ async function main() {
   }
 
   const cwd = payload.cwd || payload['cwd'] || process.cwd();
+  if (!(await isOmxManagedCwd(cwd))) {
+    process.exit(0);
+  }
   const payloadSessionId = safeString(payload.session_id || payload['session-id'] || '');
   const payloadThreadId = safeString(payload['thread-id'] || payload.thread_id || '');
   const inputMessages = normalizeInputMessages(payload);
   const latestUserInput = safeString(inputMessages.length > 0 ? inputMessages[inputMessages.length - 1] : '');
   const isTurnComplete = isTurnCompletePayload(payload);
+  const isNotifyFallbackTaskComplete = isNotifyFallbackTaskCompletePayload(payload);
 
   // Team worker detection via environment variable
-  const teamWorkerEnv = process.env.OMX_TEAM_WORKER; // e.g., "fix-ts/worker-1"
+  const teamWorkerEnv = process.env.OMX_TEAM_INTERNAL_WORKER || process.env.OMX_TEAM_WORKER; // e.g., "fix-ts/worker-1"
   const parsedTeamWorker = parseTeamWorkerEnv(teamWorkerEnv);
   const isTeamWorker = !!parsedTeamWorker;
 
-  const stateDir = (isTeamWorker && parsedTeamWorker)
+  const resolvedWorkerStateDir = (isTeamWorker && parsedTeamWorker)
     ? await resolveTeamStateDirForWorker(cwd, parsedTeamWorker)
-    : join(cwd, '.omx', 'state');
+    : null;
+  const workerStateRootResolved = !isTeamWorker || !!resolvedWorkerStateDir;
+  const stateDir = resolvedWorkerStateDir || getBaseStateDir(cwd);
   const logsDir = join(cwd, '.omx', 'logs');
   const omxDir = join(cwd, '.omx');
   let currentOmxSessionId = '';
@@ -193,12 +329,15 @@ async function main() {
 
   // Ensure directories exist
   await mkdir(logsDir, { recursive: true }).catch(() => {});
-  await mkdir(stateDir, { recursive: true }).catch(() => {});
-  currentOmxSessionId = await readCurrentSessionId(stateDir).catch(() => '') || '';
+  if (workerStateRootResolved) {
+    await mkdir(stateDir, { recursive: true }).catch(() => {});
+    currentOmxSessionId = await readCurrentSessionId(stateDir).catch(() => '') || '';
+  }
 
   // Turn-level dedupe prevents double-processing when native notify and fallback
   // watcher both emit the same completed turn.
   try {
+    if (!workerStateRootResolved) throw new Error('worker_state_root_unresolved');
     const turnId = safeString(payload['turn-id'] || payload.turn_id || '');
     if (turnId) {
       const now = Date.now();
@@ -236,6 +375,12 @@ async function main() {
           ...(turnId ? { turnId } : {}),
           timestamp: new Date().toISOString(),
           mode: safeString(payload.mode || ''),
+          ...(isNotifyFallbackTaskComplete
+            ? {
+                completed: true,
+                completionSource: 'notify-fallback-watcher',
+              }
+            : {}),
         });
       }
     } catch {
@@ -265,6 +410,32 @@ async function main() {
   await appendFile(logFile, JSON.stringify(logEntry) + '\n').catch(() => {});
 
   if (!isTurnComplete) {
+    return;
+  }
+
+  if (isTeamWorker && !workerStateRootResolved) {
+    await logNotifyHookEvent(logsDir, {
+      timestamp: new Date().toISOString(),
+      level: 'warn',
+      type: 'team_worker_state_root_unresolved',
+      team_worker: teamWorkerEnv || null,
+      reason: 'skip_team_worker_state_mutations',
+    }).catch(() => {});
+
+    // Keep the fail-closed worker state-root behavior for normal team-worker
+    // mutations, but allow the narrow auto-nudge path to use an explicitly
+    // supplied, already-existing worker state root. Auto-nudge only needs the
+    // worker-scoped state files/pane anchor and should not fall back to creating
+    // local `.omx/state` when identity resolution failed.
+    const explicitWorkerStateRoot = safeString(process.env.OMX_TEAM_STATE_ROOT || '').trim();
+    const autoNudgeStateDir = explicitWorkerStateRoot ? resolve(cwd, explicitWorkerStateRoot) : '';
+    if (autoNudgeStateDir && existsSync(autoNudgeStateDir)) {
+      try {
+        await maybeAutoNudge({ cwd, stateDir: autoNudgeStateDir, logsDir, payload });
+      } catch {
+        // Non-critical
+      }
+    }
     return;
   }
 
@@ -474,6 +645,7 @@ async function main() {
     if (latestUserInput) {
         await recordSkillActivation({
           stateDir,
+          sourceCwd: cwd,
           text: latestUserInput,
           sessionId: getEffectiveSessionId(),
           threadId: payloadThreadId,
@@ -740,8 +912,35 @@ async function main() {
   }
 }
 
+async function logFatalNotifyHookError(err: unknown): Promise<void> {
+  let cwd = process.cwd();
+  try {
+    const rawPayload = process.argv[process.argv.length - 1];
+    if (rawPayload && !rawPayload.startsWith('-')) {
+      if (utf8ByteLength(rawPayload) <= MAX_NOTIFY_ARGV_JSON_BYTES) {
+        const payload = JSON.parse(rawPayload) as Record<string, unknown>;
+        cwd = safeString(payload.cwd || payload['cwd'] || cwd) || cwd;
+      } else {
+        cwd = extractRawJsonStringField(rawPayload, ['cwd']) || cwd;
+      }
+    }
+  } catch {
+    // Keep notification hook failures silent in Codex TUI surfaces.
+  }
+
+  const logsDir = join(cwd, '.omx', 'logs');
+  await mkdir(logsDir, { recursive: true }).catch(() => {});
+  const logPath = join(logsDir, `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+  await appendFile(logPath, JSON.stringify({
+    timestamp: new Date().toISOString(),
+    type: 'notify_hook_fatal_error',
+    error: err instanceof Error ? err.message : String(err),
+  }) + '\n').catch(() => {});
+}
+
 main().catch((err) => {
-  process.exitCode = 1;
-  // eslint-disable-next-line no-console
-  console.error('[notify-hook] fatal error:', err);
+  // Notify hooks are auxiliary background work. Avoid printing stack traces into
+  // Codex TUI/PowerShell foreground panes; record diagnostics in .omx/logs.
+  process.exitCode = 0;
+  void logFatalNotifyHookError(err);
 });

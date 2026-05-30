@@ -1,4 +1,4 @@
-import type { TeamTask } from "./state.js";
+import type { TeamTask, TeamTaskCoordinationMechanism } from "./state.js";
 import { existsSync } from "fs";
 import { mkdir, readFile, rm, stat, writeFile } from "fs/promises";
 import { dirname, join } from "path";
@@ -9,7 +9,14 @@ import {
 } from "../verification/verifier.js";
 import { codexHome, listInstalledSkillDirectories } from "../utils/paths.js";
 import { sleep } from "../utils/sleep.js";
+import type { ApprovedRepositoryContextSummary } from "../planning/artifacts.js";
 import type { TeamReminderDirective } from "./reminder-intents.js";
+import type { TaskHintSummary } from "./repo-aware-decomposition.js";
+import {
+  renderTeamWorkerGoalInstruction,
+  type TeamWorkerGoalInstruction,
+} from "./goal-workflow.js";
+import { normalizeTeamTaskCoordinationPlanForRender } from "./coordination-protocol.js";
 
 const TEAM_OVERLAY_START = "<!-- OMX:TEAM:WORKER:START -->";
 const TEAM_OVERLAY_END = "<!-- OMX:TEAM:WORKER:END -->";
@@ -106,6 +113,10 @@ This file is generated for a live OMX team worker run and is disposable.
 ## Message Protocol
 - Always include \`from_worker: "${options.workerName}"\`
 - Send leader messages to \`to_worker: "leader-fixed"\`
+
+## Team Coordination Gate
+- Keep independent fan-out lightweight: normal ACK, claim-safe lifecycle, status, and verification are enough.
+- For dependencies, shared files/surfaces, handoffs, integration, blocked lanes, or changed assumptions, activate the Team Big Five / ATEM-inspired protocol: shared mental model/source of truth, ACK-readback handoffs, boundary monitoring, backup/reassignment requests, adaptability checkpoints, and team-outcome orientation.
 
 ## Scope Rules
 - Follow task-specific edit scope from inbox/task JSON only.
@@ -343,6 +354,10 @@ When your mailbox receives a message, process delivery explicitly:
 1. Read: \`omx team api mailbox-list --input "{\"team_name\":\"${teamName}\",\"worker\":\"<your-worker-name>\"}" --json\`
 2. Mark delivered: \`omx team api mailbox-mark-delivered --input "{\"team_name\":\"${teamName}\",\"worker\":\"<your-worker-name>\",\"message_id\":\"<MESSAGE_ID>\"}" --json\`
 3. If you reply, include concrete progress and keep executing your assigned work or the next feasible task after replying.
+
+## Team Coordination Gate
+- Keep independent fan-out lightweight: normal ACK, claim-safe lifecycle, status, and verification are enough.
+- For dependencies, shared files/surfaces, handoffs, integration, blocked lanes, or changed assumptions, activate the Team Big Five / ATEM-inspired protocol: shared mental model/source of truth, ACK-readback handoffs, boundary monitoring, backup/reassignment requests, adaptability checkpoints, and team-outcome orientation.
 
 ## Rules
 - Do NOT edit files outside the paths listed in your task description
@@ -632,6 +647,107 @@ async function withAgentsMdLock<T>(
   }
 }
 
+
+
+function renderTeamCoordinationGate(): string {
+  return `
+## Team Coordination Gate
+
+Use the lightweight path for independent fan-out: work your assigned scope, keep normal ACK/status updates, and avoid extra ceremony. Activate the coordinated Team Big Five / ATEM-inspired protocol only when task state or wording shows dependencies, shared files/surfaces, handoffs, integration, cross-boundary work, blocked lanes, or changing assumptions.
+`;
+}
+
+function renderCoordinationProtocol(task: TeamTask): string {
+  const plan = normalizeTeamTaskCoordinationPlanForRender(task.coordination);
+  if (!plan || plan.mode !== "coordinated") return "";
+
+  const reasons = plan.activation_reasons.length > 0
+    ? plan.activation_reasons.map((reason) => `- ${reason}`).join("\n")
+    : "- cross_boundary_or_handoff_language";
+  const mechanismText: Record<TeamTaskCoordinationMechanism, string> = {
+    shared_mental_model: "- Shared mental model / single source of truth: treat task JSON, inbox, mailbox, approved handoff, and leader updates as canonical; restate changed assumptions before acting.",
+    closed_loop_communication: "- Closed-loop communication / ACK-readback handoffs: acknowledge handoffs with what you understood, the artifact/path affected, owner, and next action.",
+    mutual_performance_monitoring: "- Mutual performance monitoring at boundaries: check upstream/downstream contracts, shared files, and verification evidence before completion.",
+    backup_behavior: "- Backup behavior: if blocked, write blocked status with the smallest needed help/reassignment request and continue any safe unblocked slice.",
+    adaptability_checkpoint: "- Adaptability checkpoint: when assumptions, dependencies, or verification results change, pause for a brief leader-facing update before widening scope.",
+    team_orientation: "- Team orientation: optimize for the team outcome, not just your local task; call out integration risks, missing tests, and peer impacts.",
+  };
+  const mechanisms = (plan.required_mechanisms && plan.required_mechanisms.length > 0
+    ? plan.required_mechanisms
+    : Object.keys(mechanismText) as TeamTaskCoordinationMechanism[]
+  ).map((mechanism) => mechanismText[mechanism]).join("\n");
+
+  return `
+### Team Coordination Protocol — Task ${task.id}
+
+Activation reasons:
+${reasons}
+
+Use this concise coordination layer for interdependent or cross-boundary work:
+${mechanisms}
+
+Completion evidence must mention either \`Coordination protocol: coordinated - <handoffs/boundaries checked>\` or \`Coordination protocol: no boundary handoff - <why no boundary remained>\`.
+`;
+}
+
+function renderCoordinationProtocols(tasks: TeamTask[]): string {
+  const sections = tasks.map(renderCoordinationProtocol).filter((section) => section.trim().length > 0);
+  if (sections.length === 0) return "";
+  return `
+## Team Big Five / ATEM Coordination Protocol
+
+${sections.join("\n")}`;
+}
+
+function renderDelegationContract(task: TeamTask): string {
+  const plan = task.delegation;
+  if (!plan || plan.mode === "none") return "";
+
+  const threshold = plan.spawn_before_serial_search_threshold ?? 3;
+  const maxParallel = plan.max_parallel_subtasks ?? 2;
+  const childModel = plan.child_model ?? "gpt-5.4-mini";
+  const candidates = (plan.subtask_candidates ?? [])
+    .map((candidate) => `- ${candidate}`)
+    .join("\n");
+  const requiredProbe = plan.required_parallel_probe
+    ? "- A parallel probe is required unless there is a documented skip reason.\n"
+    : "";
+  const skipLine = plan.skip_allowed_reason_required
+    ? "- If skipped, include `Subagent skip reason:` in your result and explain why serial work was safer or sufficient.\n"
+    : "";
+  const reportFormat = plan.child_report_format ?? "bullets";
+
+  return `
+### Native Subagent Delegation Contract — Task ${task.id}
+
+- Delegation mode: ${plan.mode}
+- Before doing more than ${threshold} serial repo-search/read commands, spawn up to ${maxParallel} Codex native subagents using model ${childModel}, wait for them, then integrate their findings before continuing.
+${requiredProbe}- Keep subagent work independent, bounded, and inside this worker's task scope.
+- Use child report format: ${reportFormat}.
+${skipLine}${candidates ? `\nRole/probe subtask candidates:\n${candidates}\n` : ""}
+Subagent evidence reporting fields:
+- Subagents spawned: <count and task names>
+- Subagent model: ${childModel}
+- Findings integrated: <brief bullets>
+- Serial searches before spawn: <number>
+
+Delegation compliance evidence (required for completion):
+- Include exactly one of these lines in the task completion \`result\` passed to \`omx team api transition-task-status\`:
+  - \`Subagent spawn evidence: <count, child task names/thread ids, and what findings were integrated>\`
+  - \`Subagent skip reason: <why serial execution was safer/sufficient>\`
+- Completion is rejected with \`missing_delegation_compliance_evidence\` when this broad-task evidence is absent.
+`;
+}
+
+function renderDelegationContracts(tasks: TeamTask[]): string {
+  const sections = tasks.map(renderDelegationContract).filter((section) => section.trim().length > 0);
+  if (sections.length === 0) return "";
+  return `
+## Native Subagent Delegation Contract
+
+${sections.join("\n")}`;
+}
+
 /**
  * Generate initial inbox file content for worker bootstrap.
  * This is written to .omx/state/team/{team}/workers/{worker}/inbox.md by the lead.
@@ -647,6 +763,10 @@ export function generateInitialInbox(
     workerRole?: string;
     rolePromptContent?: string;
     worktreeRootAgentsCanonical?: boolean;
+    taskHints?: Record<string, TaskHintSummary>;
+    approvedContextSummary?: ApprovedRepositoryContextSummary;
+    approvedContextSection?: string;
+    workerGoalInstruction?: TeamWorkerGoalInstruction;
   } = {},
 ): string {
   const taskList = tasks
@@ -655,8 +775,28 @@ export function generateInitialInbox(
       if (t.blocked_by && t.blocked_by.length > 0) {
         entry += `\n  Blocked by: ${t.blocked_by.join(", ")}`;
       }
+      if (t.depends_on && t.depends_on.length > 0 && !t.blocked_by?.length) {
+        entry += `\n  Depends on: ${t.depends_on.join(", ")}`;
+      }
       if (t.role) {
         entry += `\n  Role: ${t.role}`;
+      }
+      const hint = options.taskHints?.[t.id];
+      const filePaths = hint?.filePaths ?? t.filePaths;
+      const domains = hint?.domains ?? t.domains;
+      const lane = hint?.lane ?? t.lane;
+      const allocationReason = hint?.allocation_reason ?? t.allocation_reason;
+      if (filePaths?.length) {
+        entry += `\n  File paths: ${filePaths.join(", ")}`;
+      }
+      if (domains?.length) {
+        entry += `\n  Domains: ${domains.join(", ")}`;
+      }
+      if (lane) {
+        entry += `\n  Lane: ${lane}`;
+      }
+      if (allocationReason) {
+        entry += `\n  Allocation reason: ${allocationReason}`;
       }
       return entry;
     })
@@ -665,6 +805,26 @@ export function generateInitialInbox(
   const teamStateRoot = options.teamStateRoot || "<team_state_root>";
   const leaderCwd = options.leaderCwd || "<leader_cwd>";
   const displayRole = options.workerRole ?? agentType;
+  const delegationSection = renderDelegationContracts(tasks);
+  const coordinationGateSection = renderTeamCoordinationGate();
+  const coordinationSection = renderCoordinationProtocols(tasks);
+  const workerGoalSection = renderTeamWorkerGoalInstruction(options.workerGoalInstruction);
+
+  const approvedContextSection = options.approvedContextSection
+    ? `
+## Approved Handoff Context
+
+${options.approvedContextSection}
+`
+    : options.approvedContextSummary
+      ? `
+## Approved Repository Context Summary
+
+Source: ${options.approvedContextSummary.sourcePath}${options.approvedContextSummary.truncated ? ' (bounded/truncated)' : ''}
+
+${options.approvedContextSummary.content}
+`
+      : "";
 
   const specializationSection = options.worktreeRootAgentsCanonical === true
     ? ""
@@ -681,7 +841,7 @@ export function generateInitialInbox(
 ## Your Assigned Tasks
 
 ${taskList}
-
+${approvedContextSection}${workerGoalSection}
 ## Instructions
 
 1. Load and follow the worker skill from the first existing path:
@@ -726,6 +886,9 @@ When using \`omx team api send-message\`, ALWAYS include from_worker with YOUR w
 
 Example: omx team api send-message --input "{\"team_name\":\"${teamName}\",\"from_worker\":\"${workerName}\",\"to_worker\":\"leader-fixed\",\"body\":\"ACK: initialized\"}" --json
 
+${coordinationGateSection}
+${coordinationSection}
+${delegationSection}
 ${buildVerificationSection("each assigned task")}
 
 ## Scope Rules
@@ -743,9 +906,61 @@ ${specializationSection}`;
 export function generateTaskAssignmentInbox(
   workerName: string,
   teamName: string,
+  task: TeamTask,
+  options?: {
+    approvedContextSection?: string;
+  },
+): string;
+export function generateTaskAssignmentInbox(
+  workerName: string,
+  teamName: string,
   taskId: string,
   taskDescription: string,
+  options?: {
+    approvedContextSection?: string;
+  },
+): string;
+export function generateTaskAssignmentInbox(
+  workerName: string,
+  teamName: string,
+  taskOrId: TeamTask | string,
+  taskDescriptionArg?: string | {
+    approvedContextSection?: string;
+  },
+  optionsArg: {
+    approvedContextSection?: string;
+  } = {},
 ): string {
+  const options = typeof taskDescriptionArg === "string"
+    ? optionsArg
+    : taskDescriptionArg ?? optionsArg;
+  const task = typeof taskOrId === "string"
+    ? { id: taskOrId, description: typeof taskDescriptionArg === "string" ? taskDescriptionArg : "" }
+    : taskOrId;
+  const taskId = task.id;
+  const taskDescription = task.description;
+  const workerGoalSection = typeof taskOrId === "string"
+    ? ""
+    : renderTeamWorkerGoalInstruction({
+        teamName,
+        workerName,
+        objective: `Complete assigned OMX team task ${taskOrId.id} with verified evidence, preserving leader-owned audit.`,
+        taskIds: [taskOrId.id],
+        taskReferences: [{
+          id: taskOrId.id,
+          subject: taskOrId.subject,
+          status: taskOrId.status,
+          claimOwner: taskOrId.claim?.owner,
+          claimLeasedUntil: taskOrId.claim?.leased_until,
+        }],
+      });
+  const delegationSection = renderDelegationContracts([task as TeamTask]);
+  const coordinationGateSection = renderTeamCoordinationGate();
+  const coordinationSection = renderCoordinationProtocols([task as TeamTask]);
+  const approvedContextSection = options.approvedContextSection
+    ? `\n## Approved Handoff Context\n\n${options.approvedContextSection}\n`
+    : "";
+
   return `# New Task Assignment
 
 **Worker:** ${workerName}
@@ -754,7 +969,8 @@ export function generateTaskAssignmentInbox(
 ## Task Description
 
 ${taskDescription}
-
+${approvedContextSection}
+${workerGoalSection}
 ## Instructions
 
 1. Resolve canonical team state root and read the task file at \`<team_state_root>/team/${teamName}/tasks/task-${taskId}.json\`
@@ -769,6 +985,9 @@ ${taskDescription}
 7. Use \`omx team api release-task-claim --json\` only for rollback to \`pending\`
 8. Write \`{"state": "idle", "updated_at": "<current ISO timestamp>"}\` to your status file
 
+${coordinationGateSection}
+${coordinationSection}
+${delegationSection}
 ${buildVerificationSection(taskDescription)}
 `;
 }

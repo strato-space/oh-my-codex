@@ -38,7 +38,7 @@ Passing tests are necessary but insufficient for release quality. Without strate
 | Regression risk models | Interactive testing (qa-tester) |
 | Release readiness assessment | Evidence validation (verifier) |
 | Quality KPIs and trends | Code quality review (code-reviewer) |
-| Test depth recommendations | Security review (security-reviewer) |
+| Test depth recommendations | Security review (code-reviewer) |
 | Quality process governance | Performance review (performance-reviewer) |
 
 - Never recommend "test everything" — always prioritize by risk
@@ -50,7 +50,7 @@ Passing tests are necessary but insufficient for release quality. Without strate
 </scope_guard>
 
 <ask_gate>
-- Default to quality-first, evidence-dense outputs; use as much detail as needed for a strong result without empty verbosity.
+- Default to outcome-first, evidence-dense outputs; include the result, evidence, validation or uncertainty, and stop condition without padding.
 - Treat newer user task updates as local overrides for the active task thread while preserving earlier non-conflicting criteria.
 - If correctness depends on more reading, inspection, verification, or source gathering, keep using those tools until the strategy is grounded.
 </ask_gate>
@@ -165,7 +165,7 @@ quality-strategist + leader-routed verification evidence --> final quality gate
 <output_contract>
 ## Output Format
 
-Default final-output shape: quality-first and evidence-dense; add as much detail as needed to deliver a strong result without padding.
+Default final-output shape: outcome-first and evidence-dense; include the result, supporting evidence, validation or citation status, and stop condition without padding.
 
 ## Inputs
 
@@ -177,7 +177,7 @@ Default final-output shape: quality-first and evidence-dense; add as much detail
 | Test results / coverage | test-engineer | Assess current quality signal |
 | Interactive test findings | qa-tester | Assess behavioral quality |
 | Evidence artifacts | verifier | Validate claims |
-| Review findings | code-reviewer, security-reviewer | Assess code-level risks |
+| Review findings | code-reviewer, code-reviewer | Assess code-level risks |
 
 ## Artifact Types
 

@@ -24,6 +24,12 @@ import {
   buildLeaderMailboxTriggerDirective,
 } from "../worker-bootstrap.js";
 import { composeRoleInstructionsForRole } from "../../agents/native-config.js";
+import { buildTeamWorkerGoalInstruction } from "../goal-workflow.js";
+import {
+  normalizeUltragoalTeamContext,
+  renderLeaderOwnedUltragoalContextSection,
+  resolveLeaderOwnedUltragoalContext,
+} from "../ultragoal-context.js";
 import type { TeamTask } from "../state.js";
 
 function setMockCodexHome(codexHomePath: string): () => void {
@@ -58,6 +64,23 @@ describe("worker bootstrap", () => {
       workerSkill,
       /`?\{"status":"failed","error":"\.\.\."\}`?/,
     );
+  });
+
+  it("team and worker skills document coordination activation heuristics", async () => {
+    const teamSkill = await readFile(join(process.cwd(), "skills", "team", "SKILL.md"), "utf8");
+    const workerSkill = await readFile(join(process.cwd(), "skills", "worker", "SKILL.md"), "utf8");
+
+    for (const content of [teamSkill, workerSkill]) {
+      assert.match(content, /Team Big Five/i);
+      assert.match(content, /ATEM/i);
+      assert.match(content, /independent fan-out/i);
+      assert.match(content, /shared mental model|single source of truth/i);
+      assert.match(content, /closed-loop communication|ACK-readback/i);
+      assert.match(content, /mutual performance monitoring/i);
+      assert.match(content, /backup\/reassignment|backup behavior/i);
+      assert.match(content, /adaptability checkpoint/i);
+      assert.match(content, /team orientation/i);
+    }
   });
 
   it("generateWorkerOverlay produces markdown with correct start/end markers", () => {
@@ -278,6 +301,266 @@ describe("worker bootstrap", () => {
     assert.match(inbox, /Fix-Verify Loop/);
   });
 
+  it("generateInitialInbox renders leader-owned Ultragoal context without worker goal authority", () => {
+    const tasks: TeamTask[] = [{
+      id: "1",
+      subject: "Team runtime bridge",
+      description: "Implement Team + Ultragoal bridge",
+      status: "pending",
+      created_at: new Date().toISOString(),
+    }];
+    const contextSection = renderLeaderOwnedUltragoalContextSection({
+      kind: "leader_owned_ultragoal_context",
+      goalsPath: ".omx/ultragoal/goals.json",
+      ledgerPath: ".omx/ultragoal/ledger.jsonl",
+      activeGoalId: "G001-team-runtime-bridge",
+      activeGoalTitle: "Team runtime bridge",
+      codexGoalMode: "aggregate",
+      checkpointPolicy: "fresh_leader_get_goal_required",
+    });
+
+    const inbox = generateInitialInbox("worker-1", "team-inbox", "executor", tasks, {
+      approvedContextSection: contextSection,
+    });
+
+    assert.match(inbox, /Leader-owned Ultragoal context/);
+    assert.match(inbox, /\.omx\/ultragoal\/goals\.json/);
+    assert.match(inbox, /\.omx\/ultragoal\/ledger\.jsonl/);
+    assert.match(inbox, /G001-team-runtime-bridge/);
+    assert.match(inbox, /omx ultragoal checkpoint/);
+    assert.match(inbox, /--codex-goal-json/);
+    assert.match(inbox, /workers do not own Ultragoal goal state/);
+    assert.doesNotMatch(inbox, /worker-owned ultragoal ledger/i);
+    assert.doesNotMatch(inbox, /will auto-?launch Team from Ultragoal/i);
+  });
+
+  it("rejects unsafe Ultragoal goal IDs before rendering shell checkpoint templates", () => {
+    const context = normalizeUltragoalTeamContext({
+      kind: "leader_owned_ultragoal_context",
+      goalsPath: ".omx/ultragoal/goals.json",
+      ledgerPath: ".omx/ultragoal/ledger.jsonl",
+      activeGoalId: "G001-runtime; touch /tmp/pwned",
+      codexGoalMode: "aggregate",
+      checkpointPolicy: "fresh_leader_get_goal_required",
+    });
+
+    assert.equal(context, null);
+  });
+
+  it("preserves legacy Ultragoal per-story mode when goals.json omits codexGoalMode", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-team-ultragoal-legacy-"));
+    try {
+      await mkdir(join(wd, ".omx", "ultragoal"), { recursive: true });
+      await writeFile(
+        join(wd, ".omx", "ultragoal", "goals.json"),
+        `${JSON.stringify({
+          version: 1,
+          activeGoalId: "G001-legacy-story",
+          goals: [{
+            id: "G001-legacy-story",
+            title: "Legacy story",
+            status: "in_progress",
+          }],
+        })}\n`,
+      );
+
+      const context = await resolveLeaderOwnedUltragoalContext(wd);
+
+      assert.equal(context?.activeGoalId, "G001-legacy-story");
+      assert.equal(context?.codexGoalMode, "per_story");
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores completed or idle Ultragoal plans without an active goal", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-team-ultragoal-idle-"));
+    try {
+      await mkdir(join(wd, ".omx", "ultragoal"), { recursive: true });
+      await writeFile(
+        join(wd, ".omx", "ultragoal", "goals.json"),
+        `${JSON.stringify({
+          version: 1,
+          goals: [{
+            id: "G001-done",
+            title: "Done story",
+            status: "complete",
+          }],
+        })}\n`,
+      );
+
+      const context = await resolveLeaderOwnedUltragoalContext(wd);
+
+      assert.equal(context, null);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when present Ultragoal goals.json has an invalid codexGoalMode", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-team-ultragoal-bad-mode-"));
+    try {
+      await mkdir(join(wd, ".omx", "ultragoal"), { recursive: true });
+      await writeFile(
+        join(wd, ".omx", "ultragoal", "goals.json"),
+        `${JSON.stringify({
+          version: 1,
+          activeGoalId: "G001-active",
+          codexGoalMode: "surprise",
+          goals: [{
+            id: "G001-active",
+            title: "Active story",
+            status: "in_progress",
+          }],
+        })}\n`,
+      );
+
+      await assert.rejects(
+        () => resolveLeaderOwnedUltragoalContext(wd),
+        /invalid_ultragoal_team_context:invalid_codex_goal_mode/,
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when active Ultragoal goal is not in progress", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-team-ultragoal-stale-active-"));
+    try {
+      await mkdir(join(wd, ".omx", "ultragoal"), { recursive: true });
+      await writeFile(
+        join(wd, ".omx", "ultragoal", "goals.json"),
+        `${JSON.stringify({
+          version: 1,
+          activeGoalId: "G001-done",
+          goals: [{
+            id: "G001-done",
+            title: "Done story",
+            status: "complete",
+          }],
+        })}\n`,
+      );
+
+      await assert.rejects(
+        () => resolveLeaderOwnedUltragoalContext(wd),
+        /invalid_ultragoal_team_context:active_goal_not_in_progress:G001-done/,
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when present Ultragoal goals.json is malformed", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-team-ultragoal-malformed-"));
+    try {
+      await mkdir(join(wd, ".omx", "ultragoal"), { recursive: true });
+      await writeFile(join(wd, ".omx", "ultragoal", "goals.json"), "{bad json\n");
+
+      await assert.rejects(
+        () => resolveLeaderOwnedUltragoalContext(wd),
+        /invalid_ultragoal_team_context:malformed_goals_json/,
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when present Ultragoal goals.json has an unsafe active goal id", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-team-ultragoal-unsafe-"));
+    try {
+      await mkdir(join(wd, ".omx", "ultragoal"), { recursive: true });
+      await writeFile(
+        join(wd, ".omx", "ultragoal", "goals.json"),
+        `${JSON.stringify({
+          version: 1,
+          activeGoalId: "G001-unsafe; touch /tmp/pwned",
+          goals: [],
+        })}\n`,
+      );
+
+      await assert.rejects(
+        () => resolveLeaderOwnedUltragoalContext(wd),
+        /invalid_ultragoal_team_context:unsafe_active_goal_id/,
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+
+
+
+  it("generateInitialInbox includes scrum/team worker goal handoff tied to task IDs and claims", () => {
+    const tasks: TeamTask[] = [{
+      id: "4",
+      subject: "Implement team goal workflow",
+      description: "Wire per-worker goals into bootstrap",
+      status: "in_progress",
+      owner: "worker-4",
+      created_at: new Date(0).toISOString(),
+      claim: {
+        owner: "worker-4",
+        token: "claim-token",
+        leased_until: "2026-05-04T12:32:13.456Z",
+      },
+    }];
+
+    const workerGoalInstruction = buildTeamWorkerGoalInstruction(
+      "team-goal",
+      "worker-4",
+      tasks,
+      { teamStateRoot: "/tmp/.omx/state" },
+    );
+    const inbox = generateInitialInbox("worker-4", "team-goal", "executor", tasks, {
+      teamStateRoot: "/tmp/.omx/state",
+      workerGoalInstruction,
+    });
+
+    assert.match(inbox, /## Scrum \/ Team Goal Workflow/);
+    assert.match(inbox, /task IDs 4 instead of creating a duplicate task list/);
+    assert.match(inbox, /Task 4: Implement team goal workflow/);
+    assert.match(inbox, /active claim owner: worker-4 until 2026-05-04T12:32:13\.456Z/);
+    assert.match(inbox, /Durable OMX source of truth/);
+    assert.match(inbox, /logical Codex goal handoff only/);
+    assert.doesNotMatch(inbox, /\/tmp\/\.omx\/state\/goals\/team/);
+    assert.doesNotMatch(inbox, /leader-audit\.json/);
+    assert.match(inbox, /get_goal/);
+    assert.match(inbox, /create_goal.*only when no active goal exists/i);
+    assert.match(inbox, /update_goal\(\{status: "complete"\}\).*verification evidence/i);
+    assert.match(inbox, /shell\/team APIs persist only OMX artifacts and task state/);
+  });
+
+
+  it("generateInitialInbox includes repo-aware decomposition ownership hints", () => {
+    const inbox = generateInitialInbox(
+      "worker-1",
+      "team-dag",
+      "executor",
+      [
+        {
+          id: "1",
+          subject: "Implement DAG importer",
+          description: "Implement repo-aware decomposition",
+          status: "pending",
+          owner: "worker-1",
+          role: "executor",
+          created_at: "2026-04-27T00:00:00.000Z",
+          depends_on: ["0"],
+          filePaths: ["src/team/repo-aware-decomposition.ts"],
+          domains: ["team decomposition"],
+          lane: "implementation",
+          allocation_reason: "preserves low-overlap file/domain ownership",
+        } as TeamTask,
+      ],
+    );
+
+    assert.match(inbox, /Depends on: 0/);
+    assert.match(inbox, /File paths: src\/team\/repo-aware-decomposition\.ts/);
+    assert.match(inbox, /Domains: team decomposition/);
+    assert.match(inbox, /Lane: implementation/);
+    assert.match(inbox, /Allocation reason: preserves low-overlap file\/domain ownership/);
+  });
+
   it("generateInitialInbox shows blocked_by info for blocked tasks", () => {
     const tasks: TeamTask[] = [
       {
@@ -390,6 +673,137 @@ describe("worker bootstrap", () => {
     assert.match(inbox, /Role: test-engineer/);
   });
 
+
+
+  it("generateInitialInbox includes coordination gate but keeps independent fan-out lightweight", () => {
+    const tasks: TeamTask[] = [{
+      id: "9",
+      subject: "Independent docs sweep",
+      description: "Fan-out read-only sweep: each worker checks a separate doc with no shared files.",
+      status: "pending",
+      created_at: new Date(0).toISOString(),
+      coordination: { mode: "lightweight", activation_reasons: ["explicit_independent_fanout"] },
+    }];
+
+    const inbox = generateInitialInbox("worker-1", "team-lightweight", "executor", tasks);
+
+    assert.match(inbox, /Team Coordination Gate/);
+    assert.match(inbox, /Use the lightweight path for independent fan-out/i);
+    assert.doesNotMatch(inbox, /Team Coordination Protocol — Task 9/);
+    assert.doesNotMatch(inbox, /Coordination protocol: coordinated/);
+  });
+
+  it("generateInitialInbox includes Team Big Five and ATEM protocol for coordinated tasks", () => {
+    const tasks: TeamTask[] = [{
+      id: "10",
+      subject: "Integrate shared runtime and tests",
+      description: "Coordinate handoff across a shared runtime contract and e2e verification.",
+      status: "pending",
+      depends_on: ["3"],
+      created_at: new Date(0).toISOString(),
+      coordination: {
+        mode: "coordinated",
+        activation_reasons: ["task_dependencies", "cross_boundary_or_handoff_language"],
+        required_mechanisms: [
+          "shared_mental_model",
+          "closed_loop_communication",
+          "mutual_performance_monitoring",
+          "backup_behavior",
+          "adaptability_checkpoint",
+          "team_orientation",
+        ],
+      },
+    }];
+
+    const inbox = generateInitialInbox("worker-1", "team-coordinated", "executor", tasks);
+
+    assert.match(inbox, /Team Big Five \/ ATEM Coordination Protocol/);
+    assert.match(inbox, /Team Coordination Protocol — Task 10/);
+    assert.match(inbox, /shared mental model \/ single source of truth/i);
+    assert.match(inbox, /Closed-loop communication \/ ACK-readback handoffs/i);
+    assert.match(inbox, /Mutual performance monitoring at boundaries/i);
+    assert.match(inbox, /Backup behavior/i);
+    assert.match(inbox, /Adaptability checkpoint/i);
+    assert.match(inbox, /Team orientation/i);
+    assert.match(inbox, /Coordination protocol: coordinated/);
+  });
+
+  it("generateInitialInbox falls back to the full coordination checklist for invalid mechanism metadata", () => {
+    const tasks: TeamTask[] = [{
+      id: "11",
+      subject: "Integrate shared runtime and tests",
+      description: "Coordinate handoff across a shared runtime contract and e2e verification.",
+      status: "pending",
+      created_at: new Date(0).toISOString(),
+      coordination: {
+        mode: "coordinated",
+        activation_reasons: ["cross_boundary_or_handoff_language"],
+        required_mechanisms: ["bogus-mechanism"],
+      } as unknown as TeamTask["coordination"],
+    }];
+
+    const inbox = generateInitialInbox("worker-1", "team-coordinated", "executor", tasks);
+
+    assert.match(inbox, /Team Coordination Protocol — Task 11/);
+    assert.match(inbox, /shared mental model \/ single source of truth/i);
+    assert.match(inbox, /Closed-loop communication \/ ACK-readback handoffs/i);
+    assert.match(inbox, /Mutual performance monitoring at boundaries/i);
+    assert.match(inbox, /Backup behavior/i);
+    assert.match(inbox, /Adaptability checkpoint/i);
+    assert.match(inbox, /Team orientation/i);
+  });
+
+  it("generateInitialInbox includes Native Subagent Delegation Contract for broad delegated tasks", () => {
+    const tasks: TeamTask[] = [{
+      id: "7",
+      subject: "Investigate runtime failure",
+      description: "Search runtime and debug flaky assignment behavior",
+      status: "pending",
+      created_at: new Date(0).toISOString(),
+      delegation: {
+        mode: "auto",
+        max_parallel_subtasks: 3,
+        required_parallel_probe: true,
+        spawn_before_serial_search_threshold: 3,
+        child_model_policy: "standard",
+        child_model: "gpt-5.4-mini",
+        subtask_candidates: ["Map runtime assignment flow", "Inspect bootstrap tests"],
+        child_report_format: "bullets",
+        skip_allowed_reason_required: true,
+      },
+    }];
+
+    const inbox = generateInitialInbox("worker-1", "team-delegation", "executor", tasks);
+
+    assert.match(inbox, /Native Subagent Delegation Contract/);
+    assert.match(inbox, /Task 7/);
+    assert.match(inbox, /before doing more than 3 serial repo-search\/read commands/i);
+    assert.match(inbox, /spawn up to 3 Codex native subagents/i);
+    assert.match(inbox, /gpt-5\.4-mini/);
+    assert.match(inbox, /Map runtime assignment flow/);
+    assert.match(inbox, /Subagent evidence reporting fields/);
+    assert.match(inbox, /Delegation compliance evidence \(required for completion\)/);
+    assert.match(inbox, /Subagent spawn evidence:/);
+    assert.match(inbox, /Subagent skip reason:/);
+    assert.match(inbox, /missing_delegation_compliance_evidence/);
+  });
+
+  it("generateInitialInbox keeps mode none tasks quiet about delegation contract", () => {
+    const tasks: TeamTask[] = [{
+      id: "8",
+      subject: "Fix typo",
+      description: "Fix one typo in README.md",
+      status: "pending",
+      created_at: new Date(0).toISOString(),
+      delegation: { mode: "none" },
+    }];
+
+    const inbox = generateInitialInbox("worker-1", "team-narrow", "executor", tasks);
+
+    assert.doesNotMatch(inbox, /Native Subagent Delegation Contract/);
+    assert.doesNotMatch(inbox, /gpt-5\.4-mini/);
+  });
+
   it("generateTaskAssignmentInbox includes task ID and description", () => {
     const inbox = generateTaskAssignmentInbox(
       "worker-3",
@@ -411,6 +825,66 @@ describe("worker bootstrap", () => {
     );
     assert.match(inbox, /Verification Requirements/);
     assert.match(inbox, /PASS\/FAIL/);
+  });
+
+
+
+
+
+  it("generateTaskAssignmentInbox includes worker goal handoff for task-object follow-ups", () => {
+    const inbox = generateTaskAssignmentInbox(
+      "worker-2",
+      "team-followup-goal",
+      {
+        id: "9",
+        subject: "Finish worker audit",
+        description: "Complete the worker audit slice",
+        status: "pending",
+        created_at: new Date(0).toISOString(),
+      },
+    );
+
+    assert.match(inbox, /## Scrum \/ Team Goal Workflow/);
+    assert.match(inbox, /Task 9: Finish worker audit/);
+    assert.match(inbox, /claim required before work/);
+    assert.match(inbox, /Durable OMX source of truth/);
+    assert.match(inbox, /logical Codex goal handoff only/);
+    assert.match(inbox, /omx team api transition-task-status/);
+    assert.doesNotMatch(inbox, /<team_state_root>\/goals\/team/);
+    assert.doesNotMatch(inbox, /leader-audit\.json/);
+  });
+
+
+  it("generateTaskAssignmentInbox includes delegation contract for follow-up task object", () => {
+    const inbox = generateTaskAssignmentInbox(
+      "worker-3",
+      "team-followup",
+      {
+        id: "42",
+        subject: "Investigate parser regression",
+        description: "Investigate parser regression across tests",
+        status: "pending",
+        created_at: new Date(0).toISOString(),
+        delegation: {
+          mode: "auto",
+          max_parallel_subtasks: 3,
+          required_parallel_probe: true,
+          spawn_before_serial_search_threshold: 3,
+          child_model_policy: "standard",
+          child_model: "gpt-5.4-mini",
+          subtask_candidates: ["Search parser references", "Review parser tests"],
+          child_report_format: "bullets",
+          skip_allowed_reason_required: true,
+        },
+      },
+    );
+
+    assert.match(inbox, /Native Subagent Delegation Contract/);
+    assert.match(inbox, /spawn up to 3 Codex native subagents/i);
+    assert.match(inbox, /gpt-5\.4-mini/);
+    assert.match(inbox, /Search parser references/);
+    assert.match(inbox, /Subagent spawn evidence:/);
+    assert.match(inbox, /Subagent skip reason:/);
   });
 
   it("generateShutdownInbox contains exit instruction and concrete ack path", () => {
@@ -861,4 +1335,158 @@ describe("worker bootstrap", () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it("generateInitialInbox includes approved repository context summary when provided", () => {
+    const inbox = generateInitialInbox(
+      "worker-1",
+      "context-team",
+      "executor",
+      [{ id: "1", subject: "Implement", description: "Do task", status: "pending", owner: "worker-1", created_at: "2026-04-30T00:00:00.000Z" }],
+      {
+        approvedContextSummary: {
+          sourcePath: ".omx/plans/repo-context-issue-2039.md",
+          content: "Key boundary: preserve approved context only for matching launches.",
+          truncated: false,
+        },
+      },
+    );
+
+    assert.match(inbox, /## Approved Repository Context Summary/);
+    assert.match(inbox, /Source: \.omx\/plans\/repo-context-issue-2039\.md/);
+    assert.match(inbox, /preserve approved context only for matching launches/);
+  });
+
+  it("generateInitialInbox prefers approved handoff context when provided", () => {
+    const inbox = generateInitialInbox(
+      "worker-1",
+      "context-team",
+      "executor",
+      [{ id: "1", subject: "Implement", description: "Do task", status: "pending", owner: "worker-1", created_at: "2026-04-30T00:00:00.000Z" }],
+      {
+        approvedContextSection: [
+          "- Approved plan: .omx/plans/prd-issue-2039.md",
+          "- Test specs: .omx/plans/test-spec-issue-2039.md",
+          "- Approved context pack: .omx/context/context-20260507T120000Z-issue-2039.json",
+          "- Build refs (read first): src/build-1.ts",
+          "- Read the build refs above before broader repo exploration.",
+        ].join("\n"),
+        approvedContextSummary: {
+          sourcePath: ".omx/plans/repo-context-issue-2039.md",
+          content: "This legacy summary should be suppressed when the handoff section is present.",
+          truncated: false,
+        },
+      },
+    );
+
+    assert.match(inbox, /## Approved Handoff Context/);
+    assert.match(inbox, /Approved plan: \.omx\/plans\/prd-issue-2039\.md/);
+    assert.match(inbox, /Test specs: \.omx\/plans\/test-spec-issue-2039\.md/);
+    assert.match(inbox, /Approved context pack: \.omx\/context\/context-20260507T120000Z-issue-2039\.json/);
+    assert.match(inbox, /Build refs \(read first\): src\/build-1\.ts/);
+    assert.doesNotMatch(inbox, /## Approved Repository Context Summary/);
+  });
+
+  it("generateTaskAssignmentInbox includes approved handoff context when provided", () => {
+    const inbox = generateTaskAssignmentInbox(
+      "worker-1",
+      "team-followup",
+      {
+        id: "42",
+        subject: "Implement parser update",
+        description: "Implement parser update",
+        status: "pending",
+        created_at: "2026-04-30T00:00:00.000Z",
+      },
+      {
+        approvedContextSection: [
+          "- Approved plan: .omx/plans/prd-issue-2040.md",
+          "- Test specs: .omx/plans/test-spec-issue-2040.md",
+          "- Approved context pack: .omx/context/context-20260507T120000Z-issue-2040.json",
+          "- Build refs (read first): src/build-1.ts",
+          "- Verify refs: src/verify-2.ts",
+        ].join("\n"),
+      },
+    );
+
+    assert.match(inbox, /## Approved Handoff Context/);
+    assert.match(inbox, /Approved plan: \.omx\/plans\/prd-issue-2040\.md/);
+    assert.match(inbox, /Test specs: \.omx\/plans\/test-spec-issue-2040\.md/);
+    assert.match(inbox, /Approved context pack: \.omx\/context\/context-20260507T120000Z-issue-2040\.json/);
+    assert.match(inbox, /Build refs \(read first\): src\/build-1\.ts/);
+    assert.match(inbox, /Verify refs: src\/verify-2\.ts/);
+  });
+
+  it("generateInitialInbox preserves leader-owned Ultragoal context without worker goal state", () => {
+    const inbox = generateInitialInbox(
+      "worker-1",
+      "team-ultragoal",
+      "executor",
+      [{
+        id: "1",
+        subject: "Implement G001 bridge",
+        description: "Return Team evidence for Ultragoal checkpointing",
+        status: "pending",
+        owner: "worker-1",
+        created_at: "2026-05-13T00:00:00.000Z",
+      }],
+      {
+        approvedContextSection: [
+          "- Approved plan: .omx/plans/prd-ultragoal-team-linking.md",
+          "- Leader-owned Ultragoal context:",
+          "  - kind: leader_owned_ultragoal_context",
+          "  - goals_path: .omx/ultragoal/goals.json",
+          "  - ledger_path: .omx/ultragoal/ledger.jsonl",
+          "  - active_goal_id: G001-team-runtime-bridge",
+          "  - checkpoint_policy: fresh_leader_get_goal_required",
+          "  - Team workers provide task/evidence updates only; workers do not own ultragoal goal state or create worker ultragoal ledgers.",
+          "  - Leader checkpoint command shape:",
+          "    omx ultragoal checkpoint --goal-id G001-team-runtime-bridge --status complete --evidence \"<team evidence mentioning .omx/ultragoal and G001-team-runtime-bridge>\" --codex-goal-json <fresh-active-get_goal-json-or-path>",
+        ].join("\n"),
+      },
+    );
+
+    assert.match(inbox, /Leader-owned Ultragoal context/);
+    assert.match(inbox, /\.omx\/ultragoal\/goals\.json/);
+    assert.match(inbox, /\.omx\/ultragoal\/ledger\.jsonl/);
+    assert.match(inbox, /G001-team-runtime-bridge/);
+    assert.match(inbox, /omx ultragoal checkpoint/);
+    assert.match(inbox, /--codex-goal-json/);
+    assert.match(inbox, /fresh_leader_get_goal_required/);
+    assert.match(inbox, /workers provide task\/evidence updates only/i);
+    assert.doesNotMatch(inbox, /worker-owned ultragoal ledger/i);
+    assert.doesNotMatch(inbox, /auto[- ]launch.*team/i);
+  });
+
+  it("generateTaskAssignmentInbox preserves Ultragoal context for follow-up assignments", () => {
+    const inbox = generateTaskAssignmentInbox(
+      "worker-2",
+      "team-ultragoal",
+      {
+        id: "2",
+        subject: "Verify checkpoint evidence",
+        description: "Check Team evidence can feed the Ultragoal leader checkpoint",
+        status: "pending",
+        created_at: "2026-05-13T00:00:00.000Z",
+      },
+      {
+        approvedContextSection: [
+          "- Leader-owned Ultragoal context:",
+          "  - goals_path: .omx/ultragoal/goals.json",
+          "  - ledger_path: .omx/ultragoal/ledger.jsonl",
+          "  - active_goal_id: G001-team-runtime-bridge",
+          "  - checkpoint_policy: fresh_leader_get_goal_required",
+          "  - Leader checkpoint command shape:",
+          "    omx ultragoal checkpoint --goal-id G001-team-runtime-bridge --status complete --evidence \"<team evidence>\" --codex-goal-json <fresh-active-get_goal-json-or-path>",
+        ].join("\n"),
+      },
+    );
+
+    assert.match(inbox, /## Approved Handoff Context/);
+    assert.match(inbox, /Leader-owned Ultragoal context/);
+    assert.match(inbox, /omx ultragoal checkpoint/);
+    assert.match(inbox, /--codex-goal-json/);
+    assert.match(inbox, /fresh_leader_get_goal_required/);
+    assert.doesNotMatch(inbox, /workers? checkpoint Ultragoal/i);
+  });
+
 });

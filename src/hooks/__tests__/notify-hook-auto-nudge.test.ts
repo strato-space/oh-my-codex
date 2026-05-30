@@ -11,6 +11,14 @@ const NOTIFY_HOOK_SCRIPT = new URL('../../../dist/scripts/notify-hook.js', impor
 const DEEP_INTERVIEW_BLOCKED_APPROVAL_INPUTS = ['yes', 'y', 'proceed', 'continue', 'ok', 'sure', 'go ahead', 'next i should'];
 const NEXT_I_SHOULD_RESPONSE = 'Next I should update the focused tests.';
 const DEFAULT_AUTO_NUDGE_RESPONSE = 'continue with the current task only if it is already authorized';
+const INHERITED_OMX_ENV_KEYS = [
+  'OMX_ROOT',
+  'OMX_STATE_ROOT',
+  'OMX_SESSION_ID',
+  'OMX_SOURCE_CWD',
+  'OMX_STARTUP_CWD',
+  'OMX_ENTRY_PATH',
+] as const;
 
 async function withTempWorkingDir(run: (cwd: string) => Promise<void>): Promise<void> {
   const cwd = await mkdtemp(join(tmpdir(), 'omx-auto-nudge-'));
@@ -59,6 +67,19 @@ async function writeManagedSessionState(stateDir: string, cwd: string): Promise<
     platform: process.platform,
     pid_start_ticks: readLinuxStartTicks(process.pid),
     pid_cmdline: readLinuxCmdline(process.pid),
+  });
+}
+
+async function writeWorkerIdentityFixture(stateRoot: string, cwd: string, teamName: string, workerName: string): Promise<void> {
+  const workerDir = join(stateRoot, 'team', teamName, 'workers', workerName);
+  await mkdir(workerDir, { recursive: true });
+  await writeJson(join(workerDir, 'identity.json'), {
+    name: workerName,
+    index: Number(workerName.replace(/^worker-/, '')) || 1,
+    role: 'executor',
+    assigned_tasks: [],
+    worktree_path: cwd,
+    team_state_root: stateRoot,
   });
 }
 
@@ -175,10 +196,12 @@ function runNotifyHook(
       ...process.env,
       PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
       CODEX_HOME: codexHome,
+      ...Object.fromEntries(INHERITED_OMX_ENV_KEYS.map((key) => [key, ''])),
       ...(extraEnv.OMX_TEST_UNMANAGED_SESSION !== '1' && !extraEnv.OMX_TEAM_WORKER ? { OMX_SESSION_ID: 'sess-managed' } : {}),
       ...(extraEnv.OMX_TEST_UNMANAGED_SESSION !== '1' && !extraEnv.OMX_TEAM_WORKER ? { OMX_TEST_TMUX_SESSION_NAME: buildTmuxSessionName(cwd, 'sess-managed') } : {}),
       TMUX_PANE: '%99',
       TMUX: '1',
+      OMX_TEAM_INTERNAL_WORKER: '',
       OMX_TEAM_WORKER: '',
       OMX_TEAM_LEADER_NUDGE_MS: '9999999',
       OMX_TEAM_LEADER_STALE_MS: '9999999',
@@ -462,7 +485,7 @@ describe('notify-hook auto-nudge', () => {
       });
       assert.equal(result.status, 0, `hook failed: ${result.stderr || result.stdout}`);
 
-      const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+      const tmuxLog = await readFile(tmuxLogPath, 'utf-8').catch(() => '');
       assert.doesNotMatch(tmuxLog, defaultAutoNudgePattern('%99'));
     });
   });
@@ -1107,6 +1130,7 @@ exit 0
       await mkdir(workerStateRoot, { recursive: true });
       await mkdir(codexHome, { recursive: true });
       await mkdir(fakeBinDir, { recursive: true });
+      await writeWorkerIdentityFixture(workerStateRoot, cwd, 'auto-nudge', 'worker-1');
 
       await writeJson(join(codexHome, '.omx-config.json'), {
         autoNudge: { enabled: true, delaySec: 0, stallMs: 0 },
@@ -1131,6 +1155,41 @@ exit 0
     });
   });
 
+  it('fails closed in team-worker context when the worker state root lacks a valid identity', async () => {
+    await withTempWorkingDir(async (cwd) => {
+      const localStateRoot = join(cwd, '.omx', 'state');
+      const codexHome = join(cwd, 'codex-home');
+      const fakeBinDir = join(cwd, 'fake-bin');
+      const tmuxLogPath = join(cwd, 'tmux.log');
+
+      await mkdir(localStateRoot, { recursive: true });
+      await mkdir(codexHome, { recursive: true });
+      await mkdir(fakeBinDir, { recursive: true });
+
+      await writeJson(join(codexHome, '.omx-config.json'), {
+        autoNudge: { enabled: true, delaySec: 0, stallMs: 0 },
+      });
+
+      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
+      await chmod(join(fakeBinDir, 'tmux'), 0o755);
+
+      const result = runNotifyHook(cwd, fakeBinDir, codexHome, {
+        'last-assistant-message': 'I can continue with the worker follow-up from here.',
+      }, {
+        OMX_TEAM_WORKER: 'auto-nudge/worker-1',
+        OMX_TEAM_STATE_ROOT: '',
+      });
+      assert.equal(result.status, 0, `hook failed: ${result.stderr || result.stdout}`);
+
+      assert.equal(existsSync(join(localStateRoot, 'auto-nudge-state.json')), false, 'unvalidated worker cwd state root must not receive auto-nudge state');
+      assert.equal(existsSync(join(localStateRoot, 'team', 'auto-nudge', 'workers', 'worker-1', 'heartbeat.json')), false, 'unvalidated worker cwd state root must not receive heartbeat state');
+      if (existsSync(tmuxLogPath)) {
+        const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+        assert.doesNotMatch(tmuxLog, /send-keys/, 'unvalidated worker state root must not inject auto-nudge input');
+      }
+    });
+  });
+
   it('still auto-nudges from the stored worker pane when TMUX_PANE is missing and the worker pane looks shell-degraded', async () => {
     await withTempWorkingDir(async (cwd) => {
       const workerStateRoot = join(cwd, 'leader-state-root');
@@ -1143,6 +1202,7 @@ exit 0
       await mkdir(workerStateRoot, { recursive: true });
       await mkdir(codexHome, { recursive: true });
       await mkdir(fakeBinDir, { recursive: true });
+      await writeWorkerIdentityFixture(workerStateRoot, cwd, 'auto-nudge', 'worker-1');
 
       await writeJson(join(codexHome, '.omx-config.json'), {
         autoNudge: { enabled: true, delaySec: 0, stallMs: 0 },
@@ -1825,6 +1885,8 @@ exit 0
       await writeJson(join(codexHome, '.omx-config.json'), {
         autoNudge: { enabled: true, delaySec: 0, stallMs: 0 },
       });
+      await writeManagedSessionState(stateDir, cwd);
+      const sessionStateDir = join(stateDir, 'sessions', 'sess-managed');
 
       await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(join(cwd, 'tmux.log')));
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
@@ -1835,8 +1897,10 @@ exit 0
       });
       assert.equal(result.status, 0, `hook failed: ${result.stderr || result.stdout}`);
 
-      const skillStatePath = join(stateDir, 'skill-active-state.json');
-      assert.ok(existsSync(skillStatePath), 'skill-active-state.json should be created');
+      const rootSkillStatePath = join(stateDir, 'skill-active-state.json');
+      assert.equal(existsSync(rootSkillStatePath), false, 'session-scoped activation should not write root skill-active-state.json');
+      const skillStatePath = join(sessionStateDir, 'skill-active-state.json');
+      assert.ok(existsSync(skillStatePath), 'session skill-active-state.json should be created');
       const skillState = JSON.parse(await readFile(skillStatePath, 'utf-8')) as {
         skill: string;
         phase: string;
@@ -1954,6 +2018,7 @@ exit 0
       await writeJson(join(codexHome, '.omx-config.json'), {
         autoNudge: { enabled: true, delaySec: 0, stallMs: 0 },
       });
+      await writeManagedSessionState(stateDir, cwd);
 
       await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(join(cwd, 'tmux.log')));
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
@@ -1964,7 +2029,12 @@ exit 0
       });
       assert.equal(result.status, 0, `hook failed: ${result.stderr || result.stdout}`);
 
-      const skillState = JSON.parse(await readFile(join(stateDir, 'skill-active-state.json'), 'utf-8')) as {
+      assert.equal(
+        existsSync(join(stateDir, 'skill-active-state.json')),
+        false,
+        'session-scoped deep-interview activation should not write root skill-active-state.json',
+      );
+      const skillState = JSON.parse(await readFile(join(sessionStateDir, 'skill-active-state.json'), 'utf-8')) as {
         skill: string;
         input_lock?: { active: boolean; blocked_inputs: string[]; message: string };
       };

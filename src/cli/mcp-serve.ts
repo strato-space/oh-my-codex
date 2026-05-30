@@ -13,6 +13,7 @@ type McpServeLoaderMap = Record<McpServeEntrypoint, McpServeLoader>;
 interface McpServeCommandOptions {
   env?: Record<string, string | undefined>;
   loaders?: McpServeLoaderMap;
+  keepProcessAlive?: boolean;
 }
 
 const MCP_SERVE_USAGE = [
@@ -30,6 +31,7 @@ const MCP_SERVE_LOADERS: McpServeLoaderMap = {
   "code-intel-server.js": async () => await import("../mcp/code-intel-server.js"),
   "trace-server.js": async () => await import("../mcp/trace-server.js"),
   "wiki-server.js": async () => await import("../mcp/wiki-server.js"),
+  "hermes-server.js": async () => await import("../mcp/hermes-server.js"),
 };
 
 const MCP_SERVE_TARGET_ALIASES: Record<string, McpServeEntrypoint> = {
@@ -50,6 +52,9 @@ const MCP_SERVE_TARGET_ALIASES: Record<string, McpServeEntrypoint> = {
   wiki: "wiki-server.js",
   "wiki-server": "wiki-server.js",
   "wiki-server.js": "wiki-server.js",
+  hermes: "hermes-server.js",
+  "hermes-server": "hermes-server.js",
+  "hermes-server.js": "hermes-server.js",
 };
 
 export function normalizeOmxMcpServeTarget(
@@ -84,4 +89,12 @@ export async function mcpServeCommand(
   const loaders = options.loaders ?? MCP_SERVE_LOADERS;
   env[MCP_ENTRYPOINT_MARKER_ENV] = target;
   await loaders[target]();
+  if (options.keepProcessAlive === false) return;
+
+  // MCP server modules start their stdio lifecycle as a top-level import side
+  // effect. Keep the CLI command from returning after that import so the MCP
+  // client can complete initialize and continue using the inherited stdio
+  // transport. The server bootstrap owns shutdown when stdin closes, the parent
+  // exits, or the transport disconnects.
+  await new Promise<never>(() => undefined);
 }

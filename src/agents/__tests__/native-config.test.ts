@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, it } from "node:test";
+import { AGENT_DEFINITIONS } from "../definitions.js";
 import type { AgentDefinition } from "../definitions.js";
 import type { CatalogManifest } from "../../catalog/schema.js";
 import {
@@ -26,17 +27,49 @@ function manifestWithAgents(names: string[]): CatalogManifest {
   };
 }
 
+const originalCodexHome = process.env.CODEX_HOME;
+const originalFrontierModel = process.env.OMX_DEFAULT_FRONTIER_MODEL;
 const originalStandardModel = process.env.OMX_DEFAULT_STANDARD_MODEL;
+const originalSparkModel = process.env.OMX_DEFAULT_SPARK_MODEL;
+const originalLegacySparkModel = process.env.OMX_SPARK_MODEL;
+const isolatedCodexHome = join(
+  tmpdir(),
+  `omx-native-config-empty-codex-home-${process.pid}`,
+);
 
 beforeEach(() => {
+  process.env.CODEX_HOME = isolatedCodexHome;
+  delete process.env.OMX_DEFAULT_FRONTIER_MODEL;
   process.env.OMX_DEFAULT_STANDARD_MODEL = "gpt-5.4-mini";
+  delete process.env.OMX_DEFAULT_SPARK_MODEL;
+  delete process.env.OMX_SPARK_MODEL;
 });
 
 afterEach(() => {
+  if (typeof originalCodexHome === "string") {
+    process.env.CODEX_HOME = originalCodexHome;
+  } else {
+    delete process.env.CODEX_HOME;
+  }
+  if (typeof originalFrontierModel === "string") {
+    process.env.OMX_DEFAULT_FRONTIER_MODEL = originalFrontierModel;
+  } else {
+    delete process.env.OMX_DEFAULT_FRONTIER_MODEL;
+  }
   if (typeof originalStandardModel === "string") {
     process.env.OMX_DEFAULT_STANDARD_MODEL = originalStandardModel;
   } else {
     delete process.env.OMX_DEFAULT_STANDARD_MODEL;
+  }
+  if (typeof originalSparkModel === "string") {
+    process.env.OMX_DEFAULT_SPARK_MODEL = originalSparkModel;
+  } else {
+    delete process.env.OMX_DEFAULT_SPARK_MODEL;
+  }
+  if (typeof originalLegacySparkModel === "string") {
+    process.env.OMX_SPARK_MODEL = originalLegacySparkModel;
+  } else {
+    delete process.env.OMX_SPARK_MODEL;
   }
 });
 
@@ -70,6 +103,68 @@ describe("agents/native-config", () => {
       2,
       "only TOML delimiters should remain as raw triple quotes",
     );
+  });
+
+  it("applies per-agent reasoning overrides when generating native TOML", async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), "omx-native-config-reasoning-"));
+    try {
+      await writeFile(join(codexHome, ".omx-config.json"), JSON.stringify({
+        agentReasoning: {
+          architect: "xhigh",
+        },
+      }));
+      const agent: AgentDefinition = {
+        name: "architect",
+        description: "System design",
+        reasoningEffort: "high",
+        posture: "frontier-orchestrator",
+        modelClass: "frontier",
+        routingRole: "leader",
+        tools: "read-only",
+        category: "build",
+      };
+
+      const toml = generateAgentToml(agent, "Architect prompt", { codexHomeOverride: codexHome });
+
+      assert.match(toml, /model_reasoning_effort = "xhigh"/);
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+
+  it("pins ralplan thesis/antithesis and researcher to exact gpt-5.4-mini without downgrading judgment roles", () => {
+    process.env.OMX_DEFAULT_FRONTIER_MODEL = "gpt-5.5";
+    process.env.OMX_DEFAULT_STANDARD_MODEL = "gpt-5.5";
+
+    for (const role of ["planner", "architect", "researcher"] as const) {
+      const toml = generateAgentToml(AGENT_DEFINITIONS[role], `${role} prompt`);
+      assert.match(toml, /model = "gpt-5\.4-mini"/, `${role} should use exact mini`);
+      assert.match(toml, /exact gpt-5\.4-mini model/, `${role} should receive exact-mini guidance`);
+      assert.match(toml, /resolved_model: gpt-5\.4-mini/, `${role} should record exact mini metadata`);
+    }
+
+    const plannerToml = generateAgentToml(AGENT_DEFINITIONS.planner, "planner prompt");
+    assert.match(plannerToml, /model_reasoning_effort = "high"/);
+
+    const architectToml = generateAgentToml(AGENT_DEFINITIONS.architect, "architect prompt");
+    assert.match(architectToml, /model_reasoning_effort = "high"/);
+
+    const researcherToml = generateAgentToml(AGENT_DEFINITIONS.researcher, "researcher prompt");
+    assert.match(researcherToml, /model_reasoning_effort = "high"/);
+
+    for (const role of [
+      "critic",
+      "debugger",
+      "scholastic",
+      "prometheus-strict-metis",
+      "prometheus-strict-momus",
+      "prometheus-strict-oracle",
+    ] as const) {
+      const toml = generateAgentToml(AGENT_DEFINITIONS[role], `${role} prompt`);
+      assert.match(toml, /model = "gpt-5\.5"/, `${role} should stay on configured/root gpt-5.5`);
+      assert.doesNotMatch(toml, /model = "gpt-5\.4-mini"/, `${role} must not inherit exact-mini pins`);
+    }
   });
 
   it("applies exact-model mini guidance only for resolved gpt-5.4-mini standard roles", () => {
@@ -135,6 +230,74 @@ describe("agents/native-config", () => {
       });
       assert.equal(skipped, 0);
     } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("installs native agent TOML with configured per-agent reasoning overrides", async () => {
+    const root = await mkdtemp(join(tmpdir(), "omx-native-config-install-reasoning-"));
+    const codexHome = join(root, ".codex");
+    const promptsDir = join(root, "prompts");
+    const outDir = join(codexHome, "agents");
+
+    try {
+      await mkdir(promptsDir, { recursive: true });
+      await mkdir(codexHome, { recursive: true });
+      await writeFile(join(codexHome, ".omx-config.json"), JSON.stringify({
+        agentReasoning: {
+          architect: "xhigh",
+        },
+      }));
+      await writeFile(join(promptsDir, "architect.md"), "architect prompt");
+
+      await installNativeAgentConfigs(root, {
+        agentsDir: outDir,
+        catalogManifest: manifestWithAgents(["architect"]),
+      });
+
+      const architectToml = await readFile(join(outDir, "architect.toml"), "utf8");
+      assert.match(architectToml, /model_reasoning_effort = "xhigh"/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves active provider on native agents so websocket-capable Responses providers are inherited", async () => {
+    const root = await mkdtemp(join(tmpdir(), "omx-native-config-provider-"));
+    const codexHome = join(root, ".codex");
+    const promptsDir = join(root, "prompts");
+    const outDir = join(codexHome, "agents");
+    const previousCodexHome = process.env.CODEX_HOME;
+
+    try {
+      delete process.env.OMX_DEFAULT_STANDARD_MODEL;
+      process.env.CODEX_HOME = codexHome;
+      await mkdir(promptsDir, { recursive: true });
+      await mkdir(codexHome, { recursive: true });
+      await writeFile(join(codexHome, "config.toml"), [
+        'model = "gpt-5.5"',
+        'model_provider = "cheapRouter"',
+        '',
+        '[model_providers.cheapRouter]',
+        'name = "Cheap Router"',
+        'base_url = "https://cheaprouter.uk/v1"',
+        'wire_api = "responses"',
+        'supports_websockets = true',
+        '',
+      ].join('\n'));
+      await writeFile(join(promptsDir, "executor.md"), "executor prompt");
+
+      await installNativeAgentConfigs(root, {
+        agentsDir: outDir,
+        catalogManifest: manifestWithAgents(["executor"]),
+      });
+      const executorToml = await readFile(join(outDir, "executor.toml"), "utf8");
+      assert.match(executorToml, /model = "gpt-5\.5"/);
+      assert.match(executorToml, /model_provider = "cheapRouter"/);
+    } finally {
+      if (typeof previousCodexHome === "string") process.env.CODEX_HOME = previousCodexHome;
+      else delete process.env.CODEX_HOME;
+      process.env.OMX_DEFAULT_STANDARD_MODEL = "gpt-5.4-mini";
       await rm(root, { recursive: true, force: true });
     }
   });

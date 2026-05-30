@@ -317,6 +317,7 @@ describe('team state', () => {
       policy.delegation_only = true;
       policy.nested_teams_allowed = true;
       policy.cleanup_requires_all_workers_inactive = false;
+      policy.team_decomposition = { decomposition_source: 'dag_sidecar' };
       manifest.policy = policy;
       delete manifest.governance;
       await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
@@ -330,6 +331,8 @@ describe('team state', () => {
       assert.equal('delegation_only' in (loaded?.policy ?? {}), false);
       assert.equal('nested_teams_allowed' in (loaded?.policy ?? {}), false);
       assert.equal('cleanup_requires_all_workers_inactive' in (loaded?.policy ?? {}), false);
+      assert.equal('team_decomposition' in (loaded?.policy ?? {}), false);
+      assert.deepEqual(loaded?.team_decomposition, { decomposition_source: 'dag_sidecar' });
 
       const freshCwd = await mkdtemp(join(tmpdir(), 'omx-team-manifest-policy-default-'));
       try {
@@ -753,6 +756,21 @@ exit 1
       const t = await createTask('team-owner-write-fail', { subject: 'a', description: 'd', status: 'pending' }, cwd);
 
       previousUmask = process.umask(0o222);
+      const probeDir = join(cwd, 'claim-lock-permission-probe');
+      await mkdir(probeDir);
+      try {
+        await writeFile(join(probeDir, 'owner'), 'probe');
+        // Root and some permissive filesystems can still write through the
+        // umask-created non-writable directory, so this failure mode cannot be
+        // exercised deterministically in that environment.
+        return;
+      } catch {
+        // Expected on normal non-root POSIX filesystems; continue with the
+        // claim-lock cleanup assertion below.
+      } finally {
+        await rm(probeDir, { recursive: true, force: true });
+      }
+
       await assert.rejects(
         () => claimTask('team-owner-write-fail', t.id, 'worker-1', t.version ?? 1, cwd),
         /(EACCES|EPERM|permission denied)/i,
@@ -906,6 +924,254 @@ exit 1
       const content = await readFile(eventsPath, 'utf-8');
       assert.match(content, /\"type\":\"task_completed\"/);
       assert.match(content, new RegExp(`\"task_id\":\"${t.id}\"`));
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('transitionTaskStatus rejects broad delegated completion without spawn evidence or skip reason', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-delegation-evidence-'));
+    try {
+      await initTeamState('team-delegation-evidence', 't', 'executor', 1, cwd);
+      const t = await createTask('team-delegation-evidence', {
+        subject: 'Investigate flaky runtime behavior',
+        description: 'Search runtime and debug flaky assignment behavior',
+        status: 'pending',
+        delegation: {
+          mode: 'auto',
+          required_parallel_probe: true,
+          skip_allowed_reason_required: true,
+        },
+      }, cwd);
+      const claim = await claimTask('team-delegation-evidence', t.id, 'worker-1', t.version ?? 1, cwd);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) return;
+
+      const missing = await transitionTaskStatus(
+        'team-delegation-evidence',
+        t.id,
+        'in_progress',
+        'completed',
+        claim.claimToken,
+        cwd,
+        { result: 'Verification:\nPASS - focused regression' },
+      );
+
+      assert.equal(missing.ok, false);
+      assert.equal(missing.ok ? 'x' : missing.error, 'missing_delegation_compliance_evidence');
+      const reread = await readTask('team-delegation-evidence', t.id, cwd);
+      assert.equal(reread?.status, 'in_progress');
+
+      const completedWithSpawnEvidence = await transitionTaskStatus(
+        'team-delegation-evidence',
+        t.id,
+        'in_progress',
+        'completed',
+        claim.claimToken,
+        cwd,
+        {
+          result: [
+            'Verification:',
+            'PASS - focused regression',
+            'Subagent spawn evidence: spawned 2 native subagents for runtime map and test probe',
+          ].join('\n'),
+        },
+      );
+      assert.equal(completedWithSpawnEvidence.ok, true);
+      assert.equal(completedWithSpawnEvidence.task.delegation_compliance?.status, 'spawned');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('transitionTaskStatus requires evidence when optional delegation carries required parallel probe', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-optional-required-probe-'));
+    try {
+      await initTeamState('team-optional-required-probe', 't', 'executor', 1, cwd);
+      const t = await createTask('team-optional-required-probe', {
+        subject: 'Investigate optional delegated runtime behavior',
+        description: 'Optional mode was elevated by a required parallel probe from review enforcement',
+        status: 'pending',
+        delegation: {
+          mode: 'optional',
+          required_parallel_probe: true,
+          skip_allowed_reason_required: true,
+        },
+      }, cwd);
+      const claim = await claimTask('team-optional-required-probe', t.id, 'worker-1', t.version ?? 1, cwd);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) return;
+
+      const missing = await transitionTaskStatus(
+        'team-optional-required-probe',
+        t.id,
+        'in_progress',
+        'completed',
+        claim.claimToken,
+        cwd,
+        { result: 'Verification:\nPASS - focused regression' },
+      );
+
+      assert.equal(missing.ok, false);
+      assert.equal(missing.ok ? 'x' : missing.error, 'missing_delegation_compliance_evidence');
+      const reread = await readTask('team-optional-required-probe', t.id, cwd);
+      assert.equal(reread?.status, 'in_progress');
+
+      const completed = await transitionTaskStatus(
+        'team-optional-required-probe',
+        t.id,
+        'in_progress',
+        'completed',
+        claim.claimToken,
+        cwd,
+        {
+          result: [
+            'Verification:',
+            'PASS - focused regression',
+            'Subagent spawn evidence: spawned 1 native subagent for delegation evidence regression mapping',
+          ].join('\n'),
+        },
+      );
+
+      assert.equal(completed.ok, true);
+      assert.equal(completed.task.delegation_compliance?.status, 'spawned');
+      assert.equal(completed.task.delegation_compliance?.source, 'terminal_result');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('transitionTaskStatus accepts documented skip reason for broad delegated completion', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-delegation-skip-'));
+    try {
+      await initTeamState('team-delegation-skip', 't', 'executor', 1, cwd);
+      const t = await createTask('team-delegation-skip', {
+        subject: 'Review focused regression',
+        description: 'Audit one already-isolated failing test',
+        status: 'pending',
+        delegation: {
+          mode: 'auto',
+          required_parallel_probe: true,
+          skip_allowed_reason_required: true,
+        },
+      }, cwd);
+      const claim = await claimTask('team-delegation-skip', t.id, 'worker-1', t.version ?? 1, cwd);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) return;
+
+      const completed = await transitionTaskStatus(
+        'team-delegation-skip',
+        t.id,
+        'in_progress',
+        'completed',
+        claim.claimToken,
+        cwd,
+        {
+          result: [
+            'Verification:',
+            'PASS - focused regression',
+            'Subagent skip reason: task scope collapsed to one isolated assertion; spawning would duplicate serial verification',
+          ].join('\n'),
+        },
+      );
+
+      assert.equal(completed.ok, true);
+      assert.equal(completed.task.delegation_compliance?.status, 'skipped');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('transitionTaskStatus rejects coordinated completion without boundary evidence', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-coordination-evidence-'));
+    try {
+      await initTeamState('team-coordination-evidence', 't', 'executor', 1, cwd);
+      const t = await createTask('team-coordination-evidence', {
+        subject: 'Integrate shared runtime and tests',
+        description: 'Coordinate a handoff across shared runtime boundaries.',
+        status: 'pending',
+        coordination: {
+          mode: 'coordinated',
+          activation_reasons: ['cross_boundary_or_handoff_language'],
+          required_mechanisms: ['shared_mental_model', 'closed_loop_communication'],
+        },
+      }, cwd);
+      const claim = await claimTask('team-coordination-evidence', t.id, 'worker-1', t.version ?? 1, cwd);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) return;
+
+      const missing = await transitionTaskStatus(
+        'team-coordination-evidence',
+        t.id,
+        'in_progress',
+        'completed',
+        claim.claimToken,
+        cwd,
+        { result: 'Verification:\nPASS - focused regression' },
+      );
+
+      assert.equal(missing.ok, false);
+      assert.equal(missing.ok ? 'x' : missing.error, 'missing_coordination_compliance_evidence');
+
+      const completed = await transitionTaskStatus(
+        'team-coordination-evidence',
+        t.id,
+        'in_progress',
+        'completed',
+        claim.claimToken,
+        cwd,
+        {
+          result: [
+            'Verification:',
+            'PASS - focused regression',
+            'Coordination protocol: coordinated - shared runtime handoff and downstream boundary checks verified',
+          ].join('\n'),
+        },
+      );
+
+      assert.equal(completed.ok, true);
+      assert.equal(completed.task.coordination_compliance?.status, 'checked');
+      assert.equal(completed.task.coordination_compliance?.source, 'terminal_result');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('transitionTaskStatus accepts documented no-boundary rationale for coordinated tasks', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-coordination-no-boundary-'));
+    try {
+      await initTeamState('team-coordination-no-boundary', 't', 'executor', 1, cwd);
+      const t = await createTask('team-coordination-no-boundary', {
+        subject: 'Coordinate shared verification',
+        description: 'Original plan had a handoff, but implementation collapsed to one isolated check.',
+        status: 'pending',
+        coordination: {
+          mode: 'coordinated',
+          activation_reasons: ['cross_boundary_or_handoff_language'],
+        },
+      }, cwd);
+      const claim = await claimTask('team-coordination-no-boundary', t.id, 'worker-1', t.version ?? 1, cwd);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) return;
+
+      const completed = await transitionTaskStatus(
+        'team-coordination-no-boundary',
+        t.id,
+        'in_progress',
+        'completed',
+        claim.claimToken,
+        cwd,
+        {
+          result: [
+            'Verification:',
+            'PASS - focused regression',
+            'Coordination protocol: no boundary handoff - scope collapsed before execution; no peer-facing artifact changed',
+          ].join('\n'),
+        },
+      );
+
+      assert.equal(completed.ok, true);
+      assert.equal(completed.task.coordination_compliance?.status, 'no_boundary_handoff');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1878,6 +2144,21 @@ exit 1
       assert.equal(existsSync(root), true);
       await cleanupTeamState('team-12', cwd);
       assert.equal(existsSync(root), false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+
+  it('cleanupTeamState rejects unsafe team names before path construction', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-state-unsafe-'));
+    try {
+      const victim = join(cwd, '.omx', 'state', 'victim');
+      await mkdir(victim, { recursive: true });
+      await writeFile(join(victim, 'keep.txt'), 'keep');
+
+      await assert.rejects(() => cleanupTeamState('../victim', cwd), /invalid_team_name/);
+      assert.equal(existsSync(join(victim, 'keep.txt')), true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

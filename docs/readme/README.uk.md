@@ -43,17 +43,28 @@ OMX — це шар робочих процесів для [OpenAI Codex CLI](ht
 | HaD0Yun | [@HaD0Yun](https://github.com/HaD0Yun) |
 | Junho Yeo | [@junhoyeo](https://github.com/junhoyeo) |
 | JiHongKim98 | [@JiHongKim98](https://github.com/JiHongKim98) |
-| Lor | — |
+| Lor | [@gobylor](https://github.com/gobylor) |
 | HyunjunJeon | [@HyunjunJeon](https://github.com/HyunjunJeon) |
 
 ## Рекомендований стандартний процес
 
 Якщо ви хочете отримати стандартний досвід OMX, почніть тут:
 
+Оберіть один шлях інсталяції. Якщо Codex CLI вже встановлено (наприклад, через Homebrew):
+
 ```bash
-npm install -g @openai/codex oh-my-codex
+codex --version
+npm install -g oh-my-codex
 omx setup
 omx --madmax --high
+```
+
+Якщо Codex CLI ще не встановлено й ви хочете, щоб ним керував npm:
+
+```bash
+npm install -g @openai/codex
+npm install -g oh-my-codex
+omx setup
 ```
 
 Далі працюйте звично всередині Codex:
@@ -83,7 +94,7 @@ $team 3:executor "execute the approved plan in parallel"
 ### Вимоги
 
 - Node.js 20+
-- встановлений Codex CLI: `npm install -g @openai/codex`
+- встановлений Codex CLI, перевірений через `codex --version` (Homebrew або npm)
 - налаштована автентифікація Codex
 - `tmux` на macOS/Linux, якщо пізніше знадобиться стійкий командний рушій
 - `psmux` на нативному Windows, якщо пізніше знадобиться командний режим для Windows
@@ -182,7 +193,7 @@ omx sparkshell --tmux-pane %12 --tail-lines 400
 
 Для не-командних сесій OMX тепер працює переважно через нативні хуки:
 
-- `omx setup` має увімкнути нативні хуки Codex (`[features].codex_hooks = true`) у
+- `omx setup` має увімкнути нативні хуки Codex (`[features].hooks = true`) у
   підтримуваних областях.
 - локальні хуки Codex на рівні репозиторію є канонічною поверхнею автоматизації для не-командних сесій
 - `omx tmux-hook` зарезервовано для поведінки командного рушія та усунення проблем із застарілим tmux

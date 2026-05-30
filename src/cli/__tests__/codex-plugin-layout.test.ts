@@ -56,6 +56,7 @@ const pluginRoot = join(root, 'plugins', pluginName);
 const pluginManifestPath = join(pluginRoot, '.codex-plugin', 'plugin.json');
 const pluginMcpPath = join(pluginRoot, '.mcp.json');
 const pluginAppsPath = join(pluginRoot, '.app.json');
+const pluginHooksPath = join(pluginRoot, 'hooks', 'hooks.json');
 const marketplacePath = join(root, '.agents', 'plugins', 'marketplace.json');
 const omxBin = join(root, 'dist', 'cli', 'omx.js');
 
@@ -159,23 +160,33 @@ describe('official Codex plugin layout', () => {
     assert.ok(manifest.interface?.developerName, 'expected developerName');
   });
 
-  it('ships plugin-scoped companion metadata for MCP servers and apps while hooks stay setup-owned', async () => {
-    const [mcpManifest, appsManifest] = await Promise.all([
+  it('ships plugin-scoped hooks and disabled-by-default MCP compatibility metadata', async () => {
+    const [mcpManifest, appsManifest, hooksManifest] = await Promise.all([
       readJson<PluginMcpManifest>(pluginMcpPath),
       readJson<PluginAppsManifest>(pluginAppsPath),
+      readJson<{ hooks?: Record<string, Array<{ hooks?: Array<{ command?: string }> }>> }>(pluginHooksPath),
     ]);
     const expectedPluginMcpManifest = buildOmxPluginMcpManifest();
 
     const pluginManifest = await readJson<PluginManifest>(pluginManifestPath);
     assert.equal(pluginManifest.agents, undefined);
     assert.equal(pluginManifest.prompts, undefined);
-    assert.equal(pluginManifest.hooks, undefined);
+    assert.equal(pluginManifest.hooks, './hooks/hooks.json');
     assert.deepEqual(appsManifest, { apps: {} });
+    const hookCommands = Object.values(hooksManifest.hooks ?? {})
+      .flatMap((entries) => entries)
+      .flatMap((entry) => entry.hooks ?? [])
+      .map((hook) => hook.command);
+    assert.ok(
+      hookCommands.every((command) => command === 'node "${PLUGIN_ROOT}/hooks/codex-native-hook.mjs"'),
+      'plugin hooks should use Codex PLUGIN_ROOT instead of setup-owned .codex/hooks.json',
+    );
     assert.deepEqual(mcpManifest, expectedPluginMcpManifest);
 
     for (const [serverName, server] of Object.entries(mcpManifest.mcpServers ?? {})) {
       assert.equal(server.command, OMX_PLUGIN_MCP_COMMAND, `${serverName} should run via omx`);
-      assert.equal(server.enabled, true, `${serverName} should be enabled`);
+      assert.notEqual(server.command, 'node', `${serverName} should not depend on a bare node command`);
+      assert.equal(server.enabled, false, `${serverName} should be disabled by default`);
       assert.equal(server.args?.length, 2, `${serverName} should have serve subcommand + public target args`);
       assert.equal(server.args?.[0], OMX_PLUGIN_MCP_SERVE_SUBCOMMAND, `${serverName} should launch through omx mcp-serve`);
       const target = server.args?.[1];
@@ -186,9 +197,15 @@ describe('official Codex plugin layout', () => {
     }
   });
 
-  it('keeps plugin MCP metadata aligned with the setup-managed MCP roster', async () => {
+  it('keeps plugin MCP metadata aligned with the explicit compat setup-managed MCP roster', async () => {
     const mcpManifest = await readJson<PluginMcpManifest>(pluginMcpPath);
-    const mergedConfig = buildMergedConfig('', root, { includeTui: false });
+    const defaultConfig = buildMergedConfig('', root, { includeTui: false });
+    assert.doesNotMatch(
+      defaultConfig,
+      /^\[mcp_servers\.omx_state\]$/m,
+      'default setup config should stay CLI-first without first-party MCP tables',
+    );
+    const mergedConfig = buildMergedConfig('', root, { includeTui: false, includeFirstPartyMcp: true });
     const setupManagedServers = [...mergedConfig.matchAll(/^\[mcp_servers\.(omx_[^\]]+)\]$/gm)]
       .map((match) => match[1])
       .sort();
@@ -222,12 +239,13 @@ describe('official Codex plugin layout', () => {
     }
   });
 
-  it('does not stage plugin-scoped hook manifests or runtime hook directories', async () => {
+  it('does not stage setup-owned hook or runtime directories inside the plugin', async () => {
     const pluginEntries = await readdir(pluginRoot);
 
     assert.equal(pluginEntries.includes('.codex'), false, 'official plugin should not ship setup-owned .codex hook assets');
     assert.equal(pluginEntries.includes('.omx'), false, 'official plugin should not ship runtime hook directories');
-    assert.equal(pluginEntries.includes('hooks.json'), false, 'official plugin should not ship a plugin-scoped hooks manifest');
+    assert.equal(pluginEntries.includes('hooks.json'), false, 'official plugin hook metadata should stay under hooks/');
+    assert.equal(pluginEntries.includes('hooks'), true, 'official plugin should ship plugin-scoped lifecycle hooks');
   });
 
   it('registers the plugin in the repo marketplace with explicit source, policy, and category', async () => {
@@ -256,8 +274,11 @@ describe('official Codex plugin layout', () => {
 
     assert.deepEqual(actualSkillNames, expectedSkillNames);
     assert.ok(actualSkillNames.includes('worker'), 'internal setup-installed worker skill should be mirrored');
-    assert.equal(actualSkillNames.includes('ecomode'), false, 'merged skills should not be mirrored');
-    assert.equal(actualSkillNames.includes('swarm'), false, 'alias skills should not be mirrored');
+    assert.ok(actualSkillNames.includes('performance-goal'), 'performance-goal should be available through setup/plugin skill delivery');
+    assert.ok(actualSkillNames.includes('autoresearch-goal'), 'autoresearch-goal should be available through setup/plugin skill delivery');
+    assert.ok(actualSkillNames.includes('ultragoal'), 'ultragoal should remain available through setup/plugin skill delivery');
+    assert.equal(actualSkillNames.includes('ecomode'), false, 'deprecated skills should not be mirrored');
+    assert.equal(actualSkillNames.includes('swarm'), false, 'deprecated skills should not be mirrored');
     assert.equal(actualSkillNames.includes('configure-discord'), false, 'merged notification aliases should not be mirrored');
 
     for (const skillName of expectedSkillNames) {
@@ -292,7 +313,7 @@ describe('official Codex plugin layout', () => {
       'skills/doctor/SKILL.md',
       'skills/help/SKILL.md',
       'plugins/oh-my-codex/skills/doctor/SKILL.md',
-      'plugins/oh-my-codex/skills/help/SKILL.md',
+      'plugins/oh-my-codex/skills/omx-setup/SKILL.md',
     ];
 
     for (const docPath of docsToCheck) {
@@ -304,8 +325,8 @@ describe('official Codex plugin layout', () => {
     const combined = combinedDocs.join('\n');
     assert.match(combined, /plugins\/cache\/\$MARKETPLACE_NAME\/oh-my-codex\/\$VERSION\//);
     assert.match(combined, /not a replacement for `npm install -g oh-my-codex` plus `omx setup`/);
-    assert.match(combined, /omx setup` remains responsible for native agents, prompts\/config\/hooks\/AGENTS\.md\/HUD\/runtime wiring/);
-    assert.match(combined, /plugin-scoped companion metadata for MCP servers and apps/i);
-    assert.match(combined, /hooks stay setup-owned|hooks remain setup-owned|native \.codex\/hooks\.json coverage/i);
+    assert.match(combined, /legacy setup mode installs native agents(?:\/| and )prompts|plugin setup mode archives stale legacy prompt\/native-agent files/);
+    assert.match(combined, /plugin-scoped companion metadata for official Codex lifecycle hooks/i);
+    assert.match(combined, /legacy\/fallback native Codex hook registrations|legacy setup mode installs prompts\/native agents and \.codex\/hooks\.json/i);
   });
 });

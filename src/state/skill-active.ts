@@ -56,6 +56,7 @@ export interface SkillActiveStateLike {
 
 export interface SyncCanonicalSkillStateOptions {
   cwd: string;
+  baseStateDir?: string;
   mode: string;
   active: boolean;
   currentPhase?: string;
@@ -64,6 +65,7 @@ export interface SyncCanonicalSkillStateOptions {
   turnId?: string;
   nowIso?: string;
   source?: string;
+  allSessions?: boolean;
 }
 
 function safeString(value: unknown): string {
@@ -113,6 +115,56 @@ function normalizeSkillActiveEntry(raw: unknown): SkillActiveEntry | null {
   };
 }
 
+export function extractSessionIdFromInitializedStatePath(pathValue: unknown): string | undefined {
+  const pathText = safeString(pathValue).trim();
+  if (!pathText) return undefined;
+  const normalized = pathText.replace(/\\/g, '/');
+  const match = /(?:^|\/)sessions\/([^/]+)\/[^/]+-state\.json$/.exec(normalized);
+  return match?.[1];
+}
+
+function baseInitializationMatchesTargetSession(
+  base: SkillActiveStateLike | null,
+  targetSessionId?: string,
+): boolean {
+  const normalizedTargetSessionId = safeString(targetSessionId).trim();
+  if (!normalizedTargetSessionId) return true;
+
+  const initializedPathSessionId = extractSessionIdFromInitializedStatePath(base?.initialized_state_path);
+  if (initializedPathSessionId && initializedPathSessionId !== normalizedTargetSessionId) {
+    return false;
+  }
+
+  const baseSessionId = safeString(base?.session_id).trim();
+  if (baseSessionId && baseSessionId !== normalizedTargetSessionId) {
+    return false;
+  }
+
+  return true;
+}
+
+function sanitizeInheritedSkillActiveBase(
+  base: SkillActiveStateLike | null,
+  targetSessionId?: string,
+): SkillActiveStateLike {
+  const inherited = { ...(base ?? {}) };
+  if (!baseInitializationMatchesTargetSession(base, targetSessionId)) {
+    delete inherited.initialized_mode;
+    delete inherited.initialized_state_path;
+    delete inherited.input_lock;
+    delete inherited.context_snapshot_path;
+    delete inherited.prd_path;
+    delete inherited.test_spec_path;
+    delete inherited.task_slug;
+    delete inherited.task_description;
+    delete inherited.owner_omx_session_id;
+    delete inherited.owner_codex_session_id;
+    delete inherited.owner_codex_thread_id;
+    delete inherited.tmux_pane_id;
+  }
+  return inherited;
+}
+
 export function listActiveSkills(raw: unknown): SkillActiveEntry[] {
   if (!raw || typeof raw !== 'object') return [];
   const state = raw as SkillActiveStateLike;
@@ -122,13 +174,13 @@ export function listActiveSkills(raw: unknown): SkillActiveEntry[] {
     for (const candidate of state.active_skills) {
       const normalized = normalizeSkillActiveEntry(candidate);
       if (!normalized || normalized.active === false) continue;
-      deduped.set(normalized.skill, normalized);
+      deduped.set(entryKey(normalized), normalized);
     }
   }
 
   const topLevelSkill = safeString(state.skill).trim();
   if (deduped.size === 0 && state.active === true && topLevelSkill) {
-    deduped.set(topLevelSkill, {
+    const topLevelEntry = {
       skill: topLevelSkill,
       phase: safeString(state.phase).trim() || undefined,
       active: true,
@@ -137,7 +189,8 @@ export function listActiveSkills(raw: unknown): SkillActiveEntry[] {
       session_id: safeString(state.session_id).trim() || undefined,
       thread_id: safeString(state.thread_id).trim() || undefined,
       turn_id: safeString(state.turn_id).trim() || undefined,
-    });
+    };
+    deduped.set(entryKey(topLevelEntry), topLevelEntry);
   }
 
   return [...deduped.values()];
@@ -172,12 +225,19 @@ export function getSkillActiveStatePaths(cwd: string, sessionId?: string): {
   rootPath: string;
   sessionPath?: string;
 } {
-  const rootPath = join(omxStateDir(cwd), SKILL_ACTIVE_STATE_FILE);
+  return getSkillActiveStatePathsForStateDir(omxStateDir(cwd), sessionId);
+}
+
+export function getSkillActiveStatePathsForStateDir(stateDir: string, sessionId?: string): {
+  rootPath: string;
+  sessionPath?: string;
+} {
+  const rootPath = join(stateDir, SKILL_ACTIVE_STATE_FILE);
   const normalizedSession = safeString(sessionId).trim();
   if (!normalizedSession) return { rootPath };
   return {
     rootPath,
-    sessionPath: join(omxStateDir(cwd), 'sessions', normalizedSession, SKILL_ACTIVE_STATE_FILE),
+    sessionPath: join(stateDir, 'sessions', normalizedSession, SKILL_ACTIVE_STATE_FILE),
   };
 }
 
@@ -196,6 +256,25 @@ export async function writeSkillActiveStateCopies(
   rootState?: SkillActiveStateLike | null,
 ): Promise<void> {
   const { rootPath, sessionPath } = getSkillActiveStatePaths(cwd, sessionId);
+  await writeSkillActiveStateCopiesToPaths(rootPath, sessionPath, state, rootState);
+}
+
+export async function writeSkillActiveStateCopiesForStateDir(
+  stateDir: string,
+  state: SkillActiveStateLike,
+  sessionId?: string,
+  rootState?: SkillActiveStateLike | null,
+): Promise<void> {
+  const { rootPath, sessionPath } = getSkillActiveStatePathsForStateDir(stateDir, sessionId);
+  await writeSkillActiveStateCopiesToPaths(rootPath, sessionPath, state, rootState);
+}
+
+async function writeSkillActiveStateCopiesToPaths(
+  rootPath: string,
+  sessionPath: string | undefined,
+  state: SkillActiveStateLike,
+  rootState?: SkillActiveStateLike | null,
+): Promise<void> {
   const normalized = { version: 1, ...state };
   const normalizedRoot = rootState === null
     ? null
@@ -215,6 +294,21 @@ export async function writeSkillActiveStateCopies(
 
 export async function readVisibleSkillActiveState(cwd: string, sessionId?: string): Promise<SkillActiveStateLike | null> {
   const { rootPath, sessionPath } = getSkillActiveStatePaths(cwd, sessionId);
+  return readVisibleSkillActiveStateFromPaths(rootPath, sessionPath);
+}
+
+export async function readVisibleSkillActiveStateForStateDir(
+  stateDir: string,
+  sessionId?: string,
+): Promise<SkillActiveStateLike | null> {
+  const { rootPath, sessionPath } = getSkillActiveStatePathsForStateDir(stateDir, sessionId);
+  return readVisibleSkillActiveStateFromPaths(rootPath, sessionPath);
+}
+
+async function readVisibleSkillActiveStateFromPaths(
+  rootPath: string,
+  sessionPath?: string,
+): Promise<SkillActiveStateLike | null> {
   if (sessionPath && existsSync(sessionPath)) {
     return readSkillActiveState(sessionPath);
   }
@@ -230,6 +324,7 @@ export function tracksCanonicalWorkflowSkill(mode: string): mode is CanonicalWor
 export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkillStateOptions): Promise<void> {
   const {
     cwd,
+    baseStateDir = omxStateDir(cwd),
     mode,
     active,
     currentPhase,
@@ -238,22 +333,21 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
     turnId,
     nowIso = new Date().toISOString(),
     source = 'state-server',
+    allSessions = false,
   } = options;
 
   if (!tracksCanonicalWorkflowSkill(mode)) return;
 
-  const { rootPath, sessionPath } = getSkillActiveStatePaths(cwd, sessionId);
+  const { rootPath, sessionPath } = getSkillActiveStatePathsForStateDir(baseStateDir, sessionId);
   const existingRoot = await readSkillActiveState(rootPath);
   const existingSession = sessionPath ? await readSkillActiveState(sessionPath) : null;
-  if (!existingRoot && !existingSession && !active) return;
+  if (!existingRoot && !existingSession && !active && !options.allSessions) return;
 
   const normalizedSessionId = safeString(sessionId).trim();
+  const allRootEntries = listActiveSkills(existingRoot ?? {});
   const rootEntries = normalizedSessionId
-    ? listActiveSkills(existingRoot ?? {}).filter((entry) => {
-      const entrySessionId = safeString(entry.session_id).trim();
-      return entrySessionId.length === 0 || entrySessionId === normalizedSessionId;
-    })
-    : listActiveSkills(existingRoot ?? {});
+    ? allRootEntries.filter((entry) => safeString(entry.session_id).trim() === normalizedSessionId)
+    : allRootEntries;
   const sessionOnlyEntries = normalizedSessionId
     ? listActiveSkills(existingSession ?? {}).filter((entry) => (
       safeString(entry.session_id).trim() === normalizedSessionId
@@ -265,7 +359,7 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
     : [];
   const visibleEntries = normalizedSessionId
     ? [...rootEntries, ...sessionOnlyEntries]
-    : [...rootEntries];
+    : rootEntries.filter((entry) => safeString(entry.session_id).trim().length === 0);
 
   if (active && isTrackedWorkflowMode(mode)) {
     const currentWorkflowModes = visibleEntries
@@ -278,23 +372,25 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
     base: SkillActiveStateLike | null,
     entries: SkillActiveEntry[],
     fallbackMode: string,
+    targetSessionId?: string,
   ): SkillActiveStateLike => {
-    const currentPrimary = safeString(base?.skill).trim();
+    const inheritedBase = sanitizeInheritedSkillActiveBase(base, targetSessionId);
+    const currentPrimary = safeString(inheritedBase.skill).trim();
     const primarySkill = pickPrimaryWorkflowMode(currentPrimary, entries.map((entry) => entry.skill), fallbackMode);
     const primaryEntry = entries.find((entry) => entry.skill === primarySkill) ?? entries[0];
     return {
-      ...(base ?? {}),
+      ...inheritedBase,
       version: 1,
       active: entries.length > 0,
       skill: primaryEntry?.skill || primarySkill || fallbackMode,
-      keyword: safeString(base?.keyword).trim(),
-      phase: primaryEntry?.phase || safeString(base?.phase).trim(),
-      activated_at: primaryEntry?.activated_at || safeString(base?.activated_at).trim() || nowIso,
+      keyword: safeString(inheritedBase.keyword).trim(),
+      phase: primaryEntry?.phase || safeString(inheritedBase.phase).trim(),
+      activated_at: primaryEntry?.activated_at || safeString(inheritedBase.activated_at).trim() || nowIso,
       updated_at: nowIso,
-      source: safeString(base?.source).trim() || source,
-      session_id: primaryEntry?.session_id || safeString(base?.session_id).trim() || undefined,
-      thread_id: primaryEntry?.thread_id || safeString(base?.thread_id).trim() || undefined,
-      turn_id: primaryEntry?.turn_id || safeString(base?.turn_id).trim() || undefined,
+      source: safeString(inheritedBase.source).trim() || source,
+      session_id: primaryEntry?.session_id || safeString(inheritedBase.session_id).trim() || undefined,
+      thread_id: primaryEntry?.thread_id || safeString(inheritedBase.thread_id).trim() || undefined,
+      turn_id: primaryEntry?.turn_id || safeString(inheritedBase.turn_id).trim() || undefined,
       active_skills: entries,
     };
   };
@@ -314,15 +410,20 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
       });
     }
 
-    const nextRootEntries = rootEntries.filter((entry) => !(
+    const nextSessionRootEntries = rootEntries.filter((entry) => !(
+      entry.skill === mode
+      && safeString(entry.session_id).trim() === normalizedSessionId
+    ));
+    const nextRootEntries = allRootEntries.filter((entry) => !(
       entry.skill === mode
       && safeString(entry.session_id).trim() === normalizedSessionId
     ));
 
     const nextSessionState = applyEntriesToState(
       existingSession ?? existingRoot,
-      [...nextRootEntries, ...nextSessionEntries],
+      [...nextSessionRootEntries, ...nextSessionEntries],
       mode,
+      normalizedSessionId,
     );
     const nextRootState = nextRootEntries.length > 0
       ? applyEntriesToState(existingRoot, nextRootEntries, mode)
@@ -330,29 +431,37 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
         existingSession ?? existingRoot,
         active ? nextSessionEntries : [],
         mode,
+        normalizedSessionId,
       );
-    await writeSkillActiveStateCopies(cwd, nextSessionState, sessionId, nextRootState);
+    await writeSkillActiveStateCopiesForStateDir(baseStateDir, nextSessionState, sessionId, nextRootState);
     return;
   }
 
-  const nextRootEntries = rootEntries.filter((entry) => entry.skill !== mode);
+  const rootScopedEntries = rootEntries.filter((entry) => safeString(entry.session_id).trim().length === 0);
+  const sessionScopedRootMirrorEntries = allSessions
+    ? []
+    : rootEntries.filter((entry) => safeString(entry.session_id).trim().length > 0);
+  const nextRootScopedEntries = rootScopedEntries.filter((entry) => entry.skill !== mode);
   if (active) {
-    nextRootEntries.push({
+    nextRootScopedEntries.push({
       skill: mode,
       phase: safeString(currentPhase).trim() || undefined,
       active: true,
-      activated_at: rootEntries.find((entry) => entry.skill === mode)?.activated_at || nowIso,
+      activated_at: rootScopedEntries.find((entry) => entry.skill === mode)?.activated_at || nowIso,
       updated_at: nowIso,
       session_id: undefined,
       thread_id: safeString(threadId).trim() || undefined,
       turn_id: safeString(turnId).trim() || undefined,
     });
   }
+  const nextRootEntries = allSessions
+    ? rootEntries.filter((entry) => entry.skill !== mode)
+    : [...sessionScopedRootMirrorEntries, ...nextRootScopedEntries];
 
   const nextRootState = applyEntriesToState(existingRoot, nextRootEntries, mode);
-  await writeSkillActiveStateCopies(cwd, nextRootState, undefined, nextRootState);
+  await writeSkillActiveStateCopiesForStateDir(baseStateDir, nextRootState, undefined, nextRootState);
 
-  const sessionsDir = join(omxStateDir(cwd), 'sessions');
+  const sessionsDir = join(baseStateDir, 'sessions');
   if (!existsSync(sessionsDir)) return;
 
   const sessionIds = await readdir(sessionsDir).catch(() => []);
@@ -364,8 +473,10 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
     if (!existsSync(sessionPath)) continue;
 
     const existingSessionState = await readSkillActiveState(sessionPath);
-    const sessionOnlyEntries = filterSessionOnlyEntries(existingSessionState, rootEntries, sessionId);
-    const nextVisibleRootEntries = filterRootEntriesForSession(nextRootEntries, sessionId);
+    const sessionOnlyEntries = filterSessionOnlyEntries(existingSessionState, rootEntries, sessionId)
+      .filter((entry) => !(allSessions && entry.skill === mode));
+    const nextVisibleRootEntries = nextRootEntries
+      .filter((entry) => safeString(entry.session_id).trim() === sessionId);
     const nextSessionEntries = [...nextVisibleRootEntries, ...sessionOnlyEntries];
 
     if (nextSessionEntries.length === 0) {
@@ -377,7 +488,8 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
       existingSessionState ?? existingRoot,
       nextSessionEntries,
       nextSessionEntries[0]?.skill || mode,
+      sessionId,
     );
-    await writeSkillActiveStateCopies(cwd, nextSessionState, sessionId, nextRootState);
+    await writeSkillActiveStateCopiesForStateDir(baseStateDir, nextSessionState, sessionId, nextRootState);
   }
 }

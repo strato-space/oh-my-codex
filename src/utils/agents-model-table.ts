@@ -1,4 +1,6 @@
 import { AGENT_DEFINITIONS, type AgentDefinition } from '../agents/definitions.js';
+import { isNativeAgentInstallableStatus } from '../agents/policy.js';
+import { tryReadCatalogManifest } from '../catalog/reader.js';
 import { getRootModelName } from '../config/generator.js';
 import {
   DEFAULT_FRONTIER_MODEL,
@@ -32,6 +34,10 @@ function getAgentRecommendedModel(
   agent: AgentDefinition,
   context: AgentsModelTableContext,
 ): string {
+  if (agent.exactModel) {
+    return agent.exactModel;
+  }
+
   if (agent.name === 'executor') {
     return context.frontierModel;
   }
@@ -58,6 +64,23 @@ function buildTableRow(
   useCase: string,
 ): string {
   return `| ${escapeTableCell(formatRoleLabel(role))} | ${escapeTableCell(`\`${model}\``)} | ${escapeTableCell(reasoningEffort)} | ${escapeTableCell(useCase)} |`;
+}
+
+function getModelTableAgents(
+  definitions: Record<string, AgentDefinition>,
+): AgentDefinition[] {
+  const manifest = tryReadCatalogManifest();
+  if (!manifest) return Object.values(definitions);
+
+  const installableAgentNames = new Set(
+    manifest.agents
+      .filter((agent) => isNativeAgentInstallableStatus(agent.status))
+      .map((agent) => agent.name),
+  );
+
+  return Object.values(definitions).filter((agent) =>
+    installableAgentNames.has(agent.name),
+  );
 }
 
 export function resolveAgentsModelTableContext(
@@ -110,7 +133,7 @@ export function buildAgentsModelTable(
       'high',
       'Default standard-capability model for installable specialists and secondary worker lanes unless a role is explicitly frontier or spark.',
     ),
-    ...Object.values(definitions).map((agent) =>
+    ...getModelTableAgents(definitions).map((agent) =>
       buildTableRow(
         agent.name,
         getAgentRecommendedModel(agent, context),

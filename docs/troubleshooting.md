@@ -16,10 +16,22 @@ omx exec --skip-git-repo-check -C . "Reply with exactly OMX-EXEC-OK"
 Treat the boundary this way:
 
 - Codex plugin install/discovery may cache `oh-my-codex` under `${CODEX_HOME:-~/.codex}/plugins/cache/$MARKETPLACE_NAME/oh-my-codex/$VERSION/` (with `local` possible as a version identifier for local installs). That confirms a marketplace/plugin artifact; the packaged plugin includes plugin-scoped companion metadata for MCP servers and apps, while native/runtime hooks remain setup-owned, so it is still not the full OMX runtime setup.
-- Plugin install/discovery is not a replacement for `npm install -g oh-my-codex` plus `omx setup`; `omx setup` remains responsible for native agents, prompts/config/hooks/AGENTS.md/HUD/runtime wiring, including native `.codex/hooks.json` coverage.
+- Plugin install/discovery is not a replacement for `npm install -g oh-my-codex` plus `omx setup`; legacy setup mode installs native agents and prompts, while plugin setup mode relies on plugin discovery for bundled skills, archives/removes legacy OMX-managed prompts/skills, and refreshes setup-owned native agent TOMLs so `agent_type` roles remain available without stale generated role files.
 - `omx doctor` green: install and local runtime wiring look sane.
 - `codex login status` green: the active Codex profile can see login state.
 - `omx exec ...` returns `OMX-EXEC-OK`: real execution, auth, provider routing, and current working-directory assumptions are working together.
+
+## AGENTS.md exists, but doctor says the OMX contract is missing
+
+Other Codex ecosystem tools may rewrite `AGENTS.md` while leaving OMX prompts, skills, hooks, and config in place. In that case `omx doctor` warns when the file exists but no longer carries the generated OMX AGENTS contract marker.
+
+To preserve local guidance and restore the OMX-managed contract sections, run:
+
+```bash
+omx setup --scope user --merge-agents
+```
+
+Use `--scope project` for project-scoped setup. If you intentionally want to replace the existing file, use `omx setup --scope <user|project> --force`; setup backs up the old file before replacement.
 
 ## Green doctor, but `omx exec` fails with auth errors
 
@@ -109,3 +121,12 @@ Adjust the terminal pattern if your client advertises a different terminfo name.
 - **Open a code fix** only if you can show current `dev` fails to set `extended-keys=always` on the live OMX-owned tmux launch path.
 - **Close as environment limitation** if current `dev` sets the tmux option correctly but the reporter's terminal path still does not forward the richer key event.
 - **Prefer a docs follow-up** when the root problem is discoverability/operator guidance rather than a broken OMX codepath.
+
+## `omx explore` fallback boundaries
+
+`omx explore` has two intentionally bounded fallback paths:
+
+- **Sparkshell backend fallback**: qualifying shell-native prompts (for example `git log --oneline`) try `omx sparkshell` first. If that backend is unavailable or incompatible, stderr reports `sparkshell backend unavailable ... Falling back to the explore harness` before the harness runs.
+- **Model fallback inside the explore harness**: the harness tries the configured spark model first and then the configured fallback/standard model only if spark fails. This changes the cost/behavior boundary, so stderr emits structured attempt metadata such as `fallback-attempt=model from=... to=... reason=spark_attempt_failed exit=...`. The stdout notice `## OMX Explore fallback` is emitted only after successful fallback output.
+
+A harness limitation is different from fallback. If the harness cannot answer safely (unsupported platform, missing native binary for a packaged install, missing Rust toolchain in a checkout, or a non-shell-only task), it should report the limitation and stop or ask the caller to use the richer normal path; it should not silently broaden tools or model behavior.

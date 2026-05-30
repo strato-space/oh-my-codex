@@ -8,6 +8,8 @@ export interface AgentDefinition {
   name: string;
   description: string;
   reasoningEffort: 'low' | 'medium' | 'high';
+  /** Optional exact model pin for roles that should bypass tier defaults. */
+  exactModel?: 'gpt-5.4-mini';
   posture: 'frontier-orchestrator' | 'deep-worker' | 'fast-lane';
   modelClass: 'frontier' | 'standard' | 'fast';
   routingRole: 'leader' | 'specialist' | 'executor';
@@ -64,7 +66,8 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
   'planner': {
     name: 'planner',
     description: 'Task sequencing, execution plans, risk flags',
-    reasoningEffort: 'medium',
+    reasoningEffort: 'high',
+    exactModel: 'gpt-5.4-mini',
     posture: 'frontier-orchestrator',
     modelClass: 'frontier',
     routingRole: 'leader',
@@ -75,6 +78,7 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
     name: 'architect',
     description: 'System design, boundaries, interfaces, long-horizon tradeoffs',
     reasoningEffort: 'high',
+    exactModel: 'gpt-5.4-mini',
     posture: 'frontier-orchestrator',
     modelClass: 'frontier',
     routingRole: 'leader',
@@ -261,6 +265,7 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
     name: 'researcher',
     description: 'External documentation and reference research',
     reasoningEffort: 'high',
+    exactModel: 'gpt-5.4-mini',
     posture: 'fast-lane',
     modelClass: 'standard',
     routingRole: 'specialist',
@@ -311,9 +316,51 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
   },
 
   // Coordination
+
+  'prometheus-strict-metis': {
+    name: 'prometheus-strict-metis',
+    description: 'Prometheus Strict requirements interviewer and ambiguity mapper',
+    reasoningEffort: 'high',
+    posture: 'frontier-orchestrator',
+    modelClass: 'frontier',
+    routingRole: 'leader',
+    tools: 'analysis',
+    category: 'coordination',
+  },
+  'prometheus-strict-momus': {
+    name: 'prometheus-strict-momus',
+    description: 'Prometheus Strict adversarial plan critic and risk challenger',
+    reasoningEffort: 'high',
+    posture: 'frontier-orchestrator',
+    modelClass: 'frontier',
+    routingRole: 'leader',
+    tools: 'analysis',
+    category: 'coordination',
+  },
+  'prometheus-strict-oracle': {
+    name: 'prometheus-strict-oracle',
+    description: 'Prometheus Strict implementation readiness verifier and handoff judge',
+    reasoningEffort: 'high',
+    posture: 'frontier-orchestrator',
+    modelClass: 'standard',
+    routingRole: 'leader',
+    tools: 'analysis',
+    category: 'coordination',
+  },
+
   'critic': {
     name: 'critic',
     description: 'Plan/design critical challenge and review',
+    reasoningEffort: 'high',
+    posture: 'frontier-orchestrator',
+    modelClass: 'frontier',
+    routingRole: 'leader',
+    tools: 'read-only',
+    category: 'coordination',
+  },
+  'scholastic': {
+    name: 'scholastic',
+    description: 'Ontology-first reasoning reviewer: category mistakes, hidden assumptions, modality separation, scholastic critique, and minimal-repair proposals',
     reasoningEffort: 'high',
     posture: 'frontier-orchestrator',
     modelClass: 'frontier',

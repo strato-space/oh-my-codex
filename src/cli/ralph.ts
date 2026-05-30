@@ -2,8 +2,9 @@ import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { startMode, updateModeState } from '../modes/base.js';
-import { readApprovedExecutionLaunchHint, type ApprovedExecutionLaunchHint } from '../planning/artifacts.js';
+import { readApprovedExecutionLaunchHintOutcome, type ApprovedExecutionLaunchHint } from '../planning/artifacts.js';
 import { ensureCanonicalRalphArtifacts } from '../ralph/persistence.js';
+import { resolveCodexHomeForLaunch } from './codex-home.js';
 import {
   buildFollowupStaffingPlan,
   resolveAvailableAgentTypes,
@@ -136,6 +137,32 @@ export function extractRalphTaskDescription(args: readonly string[], fallbackTas
   return words.join(' ') || fallbackTask || 'ralph-cli-launch';
 }
 
+export function resolveApprovedRalphExecutionHint(
+  candidate: ApprovedExecutionLaunchHint | null,
+  explicitTask: string,
+): ApprovedExecutionLaunchHint | null {
+  if (!candidate) return null;
+  if (explicitTask === 'ralph-cli-launch') {
+    return candidate;
+  }
+  return candidate.task.trim() === explicitTask.trim() ? candidate : null;
+}
+
+export function readMatchedApprovedRalphExecutionHint(
+  cwd: string,
+  explicitTask: string,
+): ApprovedExecutionLaunchHint | null {
+  const outcome = readApprovedExecutionLaunchHintOutcome(
+    cwd,
+    'ralph',
+    explicitTask === 'ralph-cli-launch' ? {} : { task: explicitTask },
+  );
+  return resolveApprovedRalphExecutionHint(
+    outcome.status === 'resolved' ? outcome.hint : null,
+    explicitTask,
+  );
+}
+
 function buildRalphApprovedContextLines(approvedHint: ApprovedExecutionLaunchHint | null): string[] {
   if (!approvedHint) return [];
   const lines = [
@@ -149,6 +176,12 @@ function buildRalphApprovedContextLines(approvedHint: ApprovedExecutionLaunchHin
     lines.push(`- deep-interview specs: ${approvedHint.deepInterviewSpecPaths.join(', ')}`);
     lines.push('- Carry forward the approved deep-interview requirements and constraints during Ralph execution and final verification.');
   }
+  if (approvedHint.repositoryContextSummary) {
+    lines.push(`- approved repository context summary: ${approvedHint.repositoryContextSummary.sourcePath}${approvedHint.repositoryContextSummary.truncated ? ' (bounded/truncated)' : ''}`);
+    lines.push('Approved repository context summary (bounded, inspectable):');
+    lines.push(approvedHint.repositoryContextSummary.content);
+  }
+  lines.push('- Approved execution baseline is ready: use the approved plan, matching test specs, and any deep-interview artifacts as execution inputs.');
   return lines;
 }
 
@@ -215,6 +248,13 @@ export function buildRalphAppendInstructions(
     '- Do not declare the task complete, and do not transition into final verification/completion, while active native subagent threads are still running.',
     '- Before closing a verification wave, confirm that active native subagent threads have drained.',
     ...buildRalphApprovedContextLines(options.approvedHint ?? null),
+    'Goal mode guidance:',
+    '- If Codex goal tools are available, call `get_goal` during Ralph intake or before final verification to discover the active thread goal.',
+    '- Treat any active goal objective as the top-level completion contract for this Ralph run; Ralph mode state is not proof of goal completion by itself.',
+    '- Call `create_goal` only when the user/system explicitly requested a new goal and `get_goal` reports no active goal; otherwise do not invent a goal.',
+    '- Before completion, build a prompt-to-artifact checklist, inspect real evidence for every requirement, and continue working if any item is missing, incomplete, weakly verified, or uncovered.',
+    '- Record Ralph completion evidence in state before final Stop/cleanup: `completion_audit.passed=true`, a non-empty `completion_audit.prompt_to_artifact_checklist`, and non-empty `completion_audit.verification_evidence` (or point `completion_audit_path`/`completion_audit_evidence_path` at a repo-relative JSON artifact with those fields).',
+    '- Call `update_goal({status: "complete"})` only after that audit proves the active objective is fully achieved; then report final elapsed time and token-budget usage when provided.',
     'Final deslop guidance:',
     options.noDeslop
       ? '- `--no-deslop` is active for this Ralph run, so skip the mandatory ai-slop-cleaner final pass and use the latest successful pre-deslop verification evidence.'
@@ -255,12 +295,15 @@ export async function ralphCommand(args: string[]): Promise<void> {
   }
   assertRequiredRalphPrdJson(cwd, args);
   const artifacts = await ensureCanonicalRalphArtifacts(cwd);
-  const approvedHint = readApprovedExecutionLaunchHint(cwd, 'ralph');
   const explicitTask = extractRalphTaskDescription(normalizedArgs);
+  const approvedHint = readMatchedApprovedRalphExecutionHint(cwd, explicitTask);
   const task = explicitTask === 'ralph-cli-launch' ? approvedHint?.task ?? explicitTask : explicitTask;
   const noDeslop = normalizedArgs.some((arg) => arg.toLowerCase() === '--no-deslop');
   const availableAgentTypes = await resolveAvailableAgentTypes(cwd);
-  const staffingPlan = buildFollowupStaffingPlan('ralph', task, availableAgentTypes);
+  const codexHomeOverride = resolveCodexHomeForLaunch(cwd, process.env);
+  const staffingPlan = buildFollowupStaffingPlan('ralph', task, availableAgentTypes, {
+    codexHomeOverride,
+  });
   await startMode('ralph', task, 50);
   const sessionFiles = await writeRalphSessionFiles(cwd, task, { noDeslop, approvedHint });
   await updateModeState('ralph', {
@@ -272,6 +315,8 @@ export async function ralphCommand(args: string[]): Promise<void> {
     native_subagents_enabled: true,
     native_subagent_tracking_path: '.omx/state/subagent-tracking.json',
     native_subagent_policy: 'Parallel Codex subagents are allowed for independent work, but phase completion must wait for active native subagent threads to finish.',
+    goal_mode_integration: 'codex-goal-tools',
+    goal_mode_policy: 'Use get_goal for active objective discovery and update_goal only after a prompt-to-artifact completion audit proves the objective is achieved.',
     deslop_enabled: !noDeslop,
     deslop_opt_out: noDeslop,
     deslop_changed_files_path: sessionFiles.changedFilesPath,

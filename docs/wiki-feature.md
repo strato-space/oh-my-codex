@@ -4,7 +4,7 @@ OMX Wiki is a compiled markdown knowledge layer for agents.
 
 ## What it is
 
-- local project knowledge stored under `.omx/wiki/`
+- commit-friendly project knowledge stored under repository `omx_wiki/`
 - markdown-first and search-first
 - designed for agentic retrieval workflows, not vector-first RAG
 
@@ -21,7 +21,7 @@ OMX Wiki is a compiled markdown knowledge layer for agents.
 ## Retrieval model
 
 - Wiki pages are queried first when useful
-- `omx explore` can inject wiki-first context before broader repository search
+- `omx explore` is deprecated and compatibility-only; prefer the wiki workflow plus normal Codex repository inspection before broader repository search
 - repository search remains the fallback when wiki evidence is weak or missing
 
 ## Lifecycle model
@@ -32,4 +32,4 @@ OMX Wiki is a compiled markdown knowledge layer for agents.
 ## Constraints
 
 - no vector embeddings required
-- wiki is local project state, not source-controlled product code
+- wiki is source-visible project knowledge intended for review/commit when useful

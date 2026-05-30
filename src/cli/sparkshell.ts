@@ -23,10 +23,14 @@ const OMX_SPARKSHELL_INSTRUCTIONS_FILE_ENV = 'OMX_SPARKSHELL_MODEL_INSTRUCTIONS_
 
 export const SPARKSHELL_USAGE = [
   'Usage: omx sparkshell <command> [args...]',
+  '   or: omx sparkshell [--json] [--budget <chars>] <command> [args...]',
+  '   or: omx sparkshell --shell \'<shell command>\'',
   '   or: omx sparkshell --tmux-pane <pane-id> [--tail-lines <100-1000>]',
-  'Runs the native omx-sparkshell sidecar with direct argv execution or explicit tmux pane summarization.',
-  'Shell metacharacters such as pipes and redirects are not interpreted in v1.',
+  'Runs the native omx-sparkshell sidecar with direct argv execution, explicit shell execution, or explicit tmux pane summarization.',
+  'Shell metacharacters are interpreted only with explicit --shell opt-in.',
   'Tmux pane mode is explicit opt-in and captures a larger pane tail before applying raw-vs-summary behavior.',
+  'Environment: OMX_SPARKSHELL_BIN overrides the native binary; OMX_SPARKSHELL_MODEL selects the summary model; OMX_SPARKSHELL_FALLBACK_MODEL selects the retry model.',
+  'Environment: OMX_SPARKSHELL_MODEL_INSTRUCTIONS_FILE overrides packaged summary instructions; OMX_SPARKSHELL_SUMMARY_TIMEOUT_MS controls local API summary timeout.',
 ].join('\n');
 
 export interface ResolveSparkShellBinaryPathOptions {
@@ -230,12 +234,49 @@ interface RunSparkShellFallbackOptions {
   announce?: boolean;
 }
 
-export function parseSparkShellFallbackInvocation(args: readonly string[]): SparkShellFallbackInvocation {
+interface ParseSparkShellFallbackOptions {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  commandExists?: (command: string) => boolean;
+}
+
+export function resolveFallbackShellArgv(
+  script: string,
+  options: ParseSparkShellFallbackOptions = {},
+): string[] {
+  const {
+    platform = process.platform,
+    env = process.env,
+    commandExists = (command: string) => spawnSync(command, ['--version'], { encoding: 'utf-8', stdio: 'ignore' }).error === undefined,
+  } = options;
+
+  if (platform !== 'win32') return ['sh', '-lc', script];
+  if (commandExists('pwsh')) return ['pwsh', '-NoLogo', '-NoProfile', '-Command', script];
+  if (commandExists('powershell.exe')) return ['powershell.exe', '-NoLogo', '-NoProfile', '-Command', script];
+  return [env.ComSpec?.trim() || 'cmd.exe', '/d', '/s', '/c', script];
+}
+
+export function parseSparkShellFallbackInvocation(
+  args: readonly string[],
+  options: ParseSparkShellFallbackOptions = {},
+): SparkShellFallbackInvocation {
   if (args.length === 0) {
     throw new Error(`Missing command to run.\n${SPARKSHELL_USAGE}`);
   }
 
-  if (args[0] !== '--tmux-pane' && !args[0]?.startsWith('--tmux-pane=')) {
+  if (args[0] === '--shell') {
+    const script = args[1];
+    if (!script) throw new Error(`--shell requires a command string.\n${SPARKSHELL_USAGE}`);
+    return { kind: 'command', argv: resolveFallbackShellArgv(script, options) };
+  }
+  if (args[0]?.startsWith('--shell=')) {
+    const script = args[0].slice('--shell='.length);
+    if (!script.trim()) throw new Error(`--shell requires a command string.\n${SPARKSHELL_USAGE}`);
+    return { kind: 'command', argv: resolveFallbackShellArgv(script, options) };
+  }
+
+  const paneStart = args.findIndex((arg) => arg === '--tmux-pane' || arg.startsWith('--tmux-pane='));
+  if (paneStart < 0) {
     return { kind: 'command', argv: [...args] };
   }
 

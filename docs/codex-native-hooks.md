@@ -6,34 +6,50 @@ This page is the canonical answer to:
 
 ## Install surface
 
-`omx setup` now owns both of these native Codex artifacts:
+For plugin installs on Codex versions that report official plugin-scoped hook
+support, the packaged plugin is the hook registration surface:
 
-- `.codex/config.toml` → enables `[features].codex_hooks = true`
+- `plugins/oh-my-codex/.codex-plugin/plugin.json` → points Codex at `./hooks/hooks.json`
+- `plugins/oh-my-codex/hooks/hooks.json` → registers the OMX lifecycle hook commands with `${PLUGIN_ROOT}`
+- `.codex/config.toml` → enables `[features].plugin_hooks = true` and `[features].goals = true`
+
+`omx setup` still owns the legacy/fallback native Codex artifacts for legacy
+installs and older Codex versions that do not report `plugin_hooks`:
+
+- `.codex/config.toml` → enables the installed-Codex hook flag (`[features].hooks = true`, or legacy `[features].codex_hooks = true` when that is the only reported feature) and `[features].goals = true`
 - `.codex/hooks.json` → registers the OMX-managed native hook command while preserving non-OMX hook entries already in the file
+- `.codex/config.toml` → also records `hooks.state."<hooks.json>:<event>:<group>:<handler>".trusted_hash` for the OMX-owned wrappers so recent Codex releases do not require a manual `/hooks` review for setup-managed hooks
+
+Compatibility note: Codex CLI 0.129/0.130 treats `hooks` as the canonical stable feature key and keeps `codex_hooks` only as a legacy alias. Some public hook examples may still show `[features].codex_hooks = true`; OMX-generated fallback config intentionally emits `[features].hooks = true` while setup/uninstall migration paths still accept and normalize older `codex_hooks` entries so existing user configs do not lose hook enablement.
 
 For project scope, `.gitignore` keeps generated `.codex/hooks.json` out of source control.
 `omx uninstall` removes only the OMX-managed wrapper entries from `.codex/hooks.json`; if user hooks remain, the file stays in place.
+Project launches use a session-scoped `.omx/runtime/codex-home/<session>/` mirror for Codex runtime writes; hook review/discovery tools should treat that directory as runtime mirror state and ignore its `hooks.json` surfaces rather than loading them alongside the canonical `.codex/hooks.json`.
 
 `omx doctor` can confirm that these files exist and are shaped correctly. It does not prove that the same shell/profile can complete an authenticated Codex request; use `codex login status` plus a real `omx exec --skip-git-repo-check -C . "Reply with exactly OMX-EXEC-OK"` smoke test for that boundary.
 
 ## Ownership split
 
-- **Native Codex hooks**: `.codex/hooks.json`
+- **Plugin-scoped Codex hooks**: `plugins/oh-my-codex/hooks/hooks.json` for plugin installs on Codex versions with `[features].plugin_hooks`
+- **Legacy/fallback native Codex hooks**: `.codex/hooks.json`
 - **OMX plugin hooks**: `.omx/hooks/*.mjs`
 - **tmux/runtime fallbacks**: `omx tmux-hook`, notify-hook, derived watcher, idle/session-end reporters
 
 OMX only owns the wrapper entries that invoke `dist/scripts/codex-native-hook.js`. User-managed hook entries in the same `.codex/hooks.json` file are preserved across `omx setup` refreshes and `omx uninstall`.
+Setup-owned trust state is limited to those generated wrapper identities; user hooks and user-owned `hooks.state` entries are preserved and remain subject to Codex's normal review flow.
 
 ## Mapping matrix
 
 | OMC / OMX surface | Native Codex source | OMX runtime target | Status | Notes |
 | --- | --- | --- | --- | --- |
-| `session-start` | `SessionStart` | `session-start` | native | Native adapter refreshes session bookkeeping, restores startup developer context, and ensures `.omx/` is gitignored at the repo root |
-| wiki startup context | `SessionStart` | `session-start` | native | Wiki session-start context can append a compact `.omx/wiki/` summary when wiki pages exist; startup writes stay config-gated |
-| `keyword-detector` | `UserPromptSubmit` | `keyword-detector` | native | Persists skill activation state and can add prompt-side developer context; `$ralph` prompt routing seeds workflow state only and does not launch `omx ralph --prd ...` |
-| `pre-tool-use` | `PreToolUse` (`Bash`) | `pre-tool-use` | native-partial | Current native scope is Bash-only; built-in native behavior cautions on `rm -rf dist`, blocks inspectable inline `git commit` commands until Lore-format structure + the required `Co-authored-by: OmX <omx@oh-my-codex.dev>` trailer are present, and emits non-blocking document-refresh warnings for mapped staged commit changes that lack rule-scoped docs/spec refresh evidence |
-| `post-tool-use` | `PostToolUse` (`Bash`) | `post-tool-use` | native-partial | Current native scope is Bash-only; built-in native behavior covers command-not-found / permission-denied / missing-path guidance and informative non-zero-output review; document-refresh commit warnings use PreToolUse advisory output, with PostToolUse reserved as a future fallback if Codex advisory semantics change |
-| Ralph/persistence stop handling | `Stop` | `stop` | native-partial | Native adapter uses the documented native Stop continuation contract (`decision: "block"` + `reason`) for active Ralph runs, keeps Stop stdout empty or a single JSON object, and emits deterministic JSON continuation output if Stop dispatch fails before normal handling |
+| `session-start` | `SessionStart` | `session-start` | native | Native adapter refreshes leader session bookkeeping, preserves the canonical leader scope when a native subagent `SessionStart` is detected from rollout `session_meta`, restores startup developer context, and ensures `.omx/` is gitignored at the repo root |
+| wiki startup context | `SessionStart` | `session-start` | native | Wiki session-start context can append a compact `omx_wiki/` summary when wiki pages exist; startup writes stay config-gated |
+| `keyword-detector` | `UserPromptSubmit` | `keyword-detector` | native | Persists skill activation state and can add prompt-side developer context for top-level prompts; native subagent prompt text is treated as delegated task text, so literal workflow keywords inside a child prompt do not activate nested workflow state; `$ralph` prompt routing seeds workflow state only and does not launch `omx ralph --prd ...` |
+| ultragoal bounded steering | `UserPromptSubmit` | `ultragoal` artifacts | native | Only explicit structured directives such as `OMX_ULTRAGOAL_STEER: { ... }`, `omx.ultragoal.steer: { ... }`, or `omx ultragoal steer: { ... }` are parsed; accepted/rejected/deduped attempts route through `steerUltragoal`, append `.omx/ultragoal/ledger.jsonl`, and add advisory context without changing keyword precedence |
+| `pre-tool-use` | `PreToolUse` (`Bash`) | `pre-tool-use` | native-partial | Current native scope is Bash-only; built-in native behavior cautions on `rm -rf dist`, blocks inspectable inline `git commit` commands until Lore-format structure + the required `Co-authored-by: OmX <omx@oh-my-codex.dev>` trailer are present only when explicitly opted in with `OMX_LORE_COMMIT_GUARD=1`, and emits non-blocking document-refresh warnings for mapped staged commit changes that lack rule-scoped docs/spec refresh evidence |
+| `post-tool-use` | `PostToolUse` (`Bash`) | `post-tool-use` | native-partial | Current native scope is Bash-only; built-in native behavior covers command-not-found / permission-denied / missing-path guidance only from stderr or non-zero Bash results, ignores failure-looking strings from successful source/log reads, and keeps MCP transport-death guidance scoped to MCP-like tool calls; document-refresh commit warnings use PreToolUse advisory output, with PostToolUse reserved as a future fallback if Codex advisory semantics change |
+| Ralph/persistence stop handling | `Stop` | `stop` | native-partial | Native adapter uses the documented native Stop continuation contract (`decision: "block"` + `reason`) for active Ralph runs, emits a single JSON object on Stop stdout even for no-op Stop decisions, and emits deterministic JSON continuation output if Stop dispatch fails before normal handling |
+| imagegen continuation helper | `Stop` | `stop` | native-partial | `omx imagegen continuation <session-id> --artifact <name>` records `.omx/state/sessions/<session>/imagegen-pending.json` and queues an audited exec follow-up so built-in `image_gen` turns that must end immediately can resume Ralph visual QA/recovery at the next Stop checkpoint |
 | Autopilot continuation | `Stop` | `stop` | native-partial | Native adapter continues non-terminal autopilot sessions from active session/root mode state |
 | Ultrawork continuation | `Stop` | `stop` | native-partial | Native adapter continues non-terminal ultrawork sessions from active session/root mode state |
 | UltraQA continuation | `Stop` | `stop` | native-partial | Native adapter continues non-terminal ultraqa sessions from active session/root mode state |
@@ -41,6 +57,7 @@ OMX only owns the wrapper entries that invoke `dist/scripts/codex-native-hook.js
 | `ralplan` skill-state continuation | `Stop` | `stop` | native-partial | Native adapter can block on active `skill-active-state.json` for `ralplan`, unless active subagents are already the real in-flight owners |
 | `deep-interview` skill-state continuation | `Stop` | `stop` | native-partial | Native adapter can block on active `skill-active-state.json` for `deep-interview`, unless active subagents are already the real in-flight owners |
 | auto-nudge continuation | `Stop` | `stop` | native-partial | Native adapter continues turns that end in a permission/stall prompt, can re-fire for later fresh replies, and suppresses auto-nudge while interview / deep-interview state is active; explicit terminal lifecycle metadata should be authoritative when present, legacy `blocked_on_user` remains a suppress-continuation compatibility signal, and `cancelled` stays internal legacy-only for user-facing lifecycle summaries |
+| team worker Stop nudge | `Stop` | `stop` | native-partial | Team worker leader nudges are lifecycle-driven: a resolved allowed native worker Stop may notify the leader through guarded delivery after the non-terminal task guard passes. Deprecated worker stall/progress environment knobs such as `OMX_TEAM_PROGRESS_STALL_MS` and `OMX_TEAM_WORKER_TURN_STALL_MS` are compatibility/test-only surfaces and must not be documented as active team-nudge tuning knobs. |
 | `ask-user-question` | none | runtime-only | runtime-fallback | No distinct Codex native hook today |
 | `PostToolUseFailure` | none | runtime-only | runtime-fallback | Fold into runtime/fallback handling until native support exists |
 | non-Bash tool interception | none | runtime-only | runtime-fallback | Current Codex native tool hooks expose Bash only |
@@ -57,7 +74,32 @@ The native hook adapter includes an agent-only document-refresh warning MVP for
 spec-driven development hygiene. It does **not** install a generic CI gate, does
 **not** add a repo-wide pre-commit framework, and must not hard-block `git
 commit` for document-refresh reasons. Existing Lore commit blocking remains
-separate and still wins when an inline commit message is not Lore-compliant.
+separate and still wins when the Lore commit guard is explicitly enabled and an
+inline commit message is not Lore-compliant.
+
+## Lore commit guard opt-in
+
+Lore commit enforcement is disabled by default. To require Lore-format inline
+commit messages and the OmX co-author trailer while keeping OMX-managed native
+hooks installed, set `OMX_LORE_COMMIT_GUARD` to `1`, `true`, `yes`, or `on`.
+
+For persistent Codex CLI usage, place the opt-in in `config.toml`:
+
+```toml
+[shell_environment_policy.set]
+OMX_LORE_COMMIT_GUARD = "1"
+```
+
+The opt-in controls only the Lore-style `git commit` blocking guard. Other
+native `PreToolUse` checks, including document-refresh warnings and command
+safety checks, still run. Native hook enforcement reads the same persistent
+Codex config fallback when the hook process does not already have
+`OMX_LORE_COMMIT_GUARD` in its environment. Inline command environment still
+wins for that command, so `OMX_LORE_COMMIT_GUARD=0 git commit ...` disables a
+persistent opt-in and `env -u OMX_LORE_COMMIT_GUARD git commit ...` removes the
+persistent fallback for that invocation. `omx doctor` reports whether the guard
+is enabled by explicit opt-in, disabled by default/config/environment, or
+disabled because an explicit value is invalid.
 
 Warning scope is intentionally narrow and rule-scoped:
 
@@ -98,10 +140,10 @@ instead of using an unrelated docs edit as a blanket suppression.
 
 The approved OMX-native wiki backport keeps lifecycle ownership intentionally narrow:
 
-- **Storage** lives under `.omx/wiki/`, not `.omc/wiki/`.
-- **SessionStart** may surface bounded wiki context from `.omx/wiki/` when the wiki already exists, but it should stay read-mostly and must not block the native hook path on expensive writes or index rebuilds.
-- **SessionEnd** remains a runtime/notify-path responsibility for best-effort, non-blocking session capture into `.omx/wiki/`.
-- **PreCompact parity is intentionally deferred** in v1 unless a clearly OMX-native compaction seam exists.
+- **Storage** lives under repository `omx_wiki/`, not ignored `.omx/wiki/` runtime state and not `.omc/wiki/`.
+- **SessionStart** may surface bounded wiki context from `omx_wiki/` when the wiki already exists, but it should stay read-mostly and must not block the native hook path on expensive writes or index rebuilds.
+- **SessionEnd** remains a runtime/notify-path responsibility for best-effort, non-blocking session capture into `omx_wiki/`.
+- **PreCompact** and **PostCompact** are native and no-stdout by default: they record the lifecycle seams without emitting advisory `additionalContext` that Codex rejects for compact hook events.
 - **Routing should stay explicit**: prefer `$wiki` or task verbs like `wiki query` / `wiki add`, and avoid implicit bare `wiki` noun activation.
 
 ## Explicit terminal stop model note
@@ -136,6 +178,17 @@ operator to clear incompatible state explicitly via `omx state ...` or the
 ## UserPromptSubmit: triage advisory context
 
 `UserPromptSubmit` can now emit triage advisory context alongside keyword context. When no keyword matches, the triage layer classifies the prompt and may inject an advisory prompt-routing context string — this is advisory prompt-routing context that does not activate a skill or workflow by itself; it adds a developer-context hint the model may follow. Light advisory destinations include repo-local `explore`, narrow-edit `executor`, visual `designer`, and external documentation/reference `researcher`; researcher routing is for official-doc, version-compatibility, source-backed, or external lookup requests, does not override local anchors or implementation-shaped prompts, and still writes only prompt-routing state. Keywords remain the deterministic control surface: a matched keyword always takes precedence over triage output, and users can suppress triage injection per prompt with phrases such as `no workflow`, `just chat`, or `plain answer`.
+
+Tracked native subagent `UserPromptSubmit` events are intentionally isolated from keyword activation and triage injection. The parent may delegate a child prompt that starts with text such as `$ralplan Architect review step...`; once the child native session is known in `.omx/state/subagent-tracking.json`, that prompt is handled as literal task text rather than as a fresh workflow invocation. Top-level prompt submits are unchanged and still activate workflows normally.
+
+
+## UserPromptSubmit: bounded ultragoal steering
+
+When `.omx/ultragoal/goals.json` exists, native `UserPromptSubmit` can apply bounded ultragoal steering only from explicit structured directives. The parser recognizes JSON objects after labels such as `OMX_ULTRAGOAL_STEER:`, `omx.ultragoal.steer:`, or `omx ultragoal steer:`. It does not infer mutations from ordinary prose.
+
+Accepted and rejected proposals are delegated to `src/ultragoal/artifacts.ts` via `steerUltragoal`, so hook code does not own mutation semantics. The hook returns additional context that names `.omx/ultragoal/goals.json`, `.omx/ultragoal/ledger.jsonl`, the accepted/rejected/deduped status, and the invariant result. Steering context is additive with keyword, goal-warning, and triage context; keyword routing still takes precedence.
+
+The steering invariants are the same as the CLI: no aggregate objective edits, no constraint edits, no hard delete, no auto-complete, no silent mutation, and no broad natural-language magic. Repeated prompt-submit directives dedupe by prompt signature or idempotency key so structural mutations are not duplicated.
 
 ## Verification guidance
 

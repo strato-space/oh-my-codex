@@ -48,6 +48,13 @@ const OMX_FIRST_PARTY_MCP_SPECS: readonly OmxFirstPartyMcpSpec[] = [
     pluginTarget: "wiki",
     startupTimeoutSec: 5,
   },
+  {
+    name: "omx_hermes",
+    title: "# OMX Hermes Coordination MCP Server (safe dispatch/status/artifacts)",
+    entrypoint: "hermes-server.js",
+    pluginTarget: "hermes",
+    startupTimeoutSec: 5,
+  },
 ] as const;
 
 export const OMX_FIRST_PARTY_MCP_SERVER_NAMES = OMX_FIRST_PARTY_MCP_SPECS.map(
@@ -76,20 +83,26 @@ export function resolveOmxFirstPartyMcpEntrypointForPluginTarget(
   return spec?.entrypoint ?? null;
 }
 
+export function getCurrentNodeExecutablePath(): string {
+  return process.execPath;
+}
+
 export function getOmxFirstPartySetupMcpServers(
   pkgRoot: string,
 ): Array<UnifiedMcpRegistryServer & { title: string }> {
   return OMX_FIRST_PARTY_MCP_SPECS.map((spec) => ({
     name: spec.name,
     title: spec.title,
-    command: "node",
+    command: getCurrentNodeExecutablePath(),
     args: [join(pkgRoot, "dist", "mcp", spec.entrypoint)],
     enabled: true,
     startupTimeoutSec: spec.startupTimeoutSec,
   }));
 }
 
-export function buildOmxPluginMcpManifest(): {
+export function buildOmxPluginMcpManifest(
+  options: { enabled?: boolean } = {},
+): {
   mcpServers: Record<
     string,
     {
@@ -106,7 +119,7 @@ export function buildOmxPluginMcpManifest(): {
         {
           command: OMX_PLUGIN_MCP_COMMAND,
           args: [OMX_PLUGIN_MCP_SERVE_SUBCOMMAND, spec.pluginTarget],
-          enabled: true,
+          enabled: options.enabled === true,
         },
       ]),
     ),

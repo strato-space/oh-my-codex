@@ -5,6 +5,21 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+
+function isolatedChildEnv(fakeBinDir: string): NodeJS.ProcessEnv {
+  const tmuxBin = join(fakeBinDir, 'tmux');
+  return {
+    PATH: `${fakeBinDir}:${process.env.PATH ?? ''}`,
+    OMX_TEST_TMUX_BIN: tmuxBin,
+    HOME: process.env.HOME,
+    TMPDIR: process.env.TMPDIR,
+    TEMP: process.env.TEMP,
+    TMP: process.env.TMP,
+    SystemRoot: process.env.SystemRoot,
+    WINDIR: process.env.WINDIR,
+  };
+}
+
 function buildFakeTmux(tmuxLogPath: string): string {
   return `#!/usr/bin/env bash
 set -eu
@@ -20,24 +35,27 @@ function runSendPaneInputInChild(params: {
   prompt: string;
   submitKeyPresses: number;
   typePrompt: boolean;
+  queueFirstSubmit?: boolean;
 }) {
   const payload = JSON.stringify({
     paneTarget: params.paneTarget,
     prompt: params.prompt,
     submitKeyPresses: params.submitKeyPresses,
+    tmuxBin: join(params.fakeBinDir, 'tmux'),
     typePrompt: params.typePrompt,
+    queueFirstSubmit: params.queueFirstSubmit,
   });
   const script = `
-    import { sendPaneInput } from ${JSON.stringify(params.moduleUrl)};
-    const result = await sendPaneInput(${payload});
+    const input = ${payload};
+    process.env.OMX_TEST_TMUX_BIN = input.tmuxBin;
+    process.env.PATH = ${JSON.stringify('__CHILD_PATH__')};
+    const { sendPaneInput } = await import(${JSON.stringify(params.moduleUrl)});
+    const result = await sendPaneInput(input);
     process.stdout.write(JSON.stringify(result));
-  `;
+  `.replace('__CHILD_PATH__', `${params.fakeBinDir}:${process.env.PATH ?? ''}`);
   return spawnSync(process.execPath, ['--input-type=module', '-e', script], {
     encoding: 'utf-8',
-    env: {
-      ...process.env,
-      PATH: `${params.fakeBinDir}:${process.env.PATH ?? ''}`,
-    },
+    env: isolatedChildEnv(params.fakeBinDir),
   });
 }
 
@@ -50,19 +68,19 @@ function runEvaluatePaneInjectionReadinessInChild(params: {
   const payload = JSON.stringify({
     paneTarget: params.paneTarget,
     options: params.options ?? {},
+    tmuxBin: join(params.fakeBinDir, 'tmux'),
   });
   const script = `
-    import { evaluatePaneInjectionReadiness } from ${JSON.stringify(params.moduleUrl)};
     const input = ${payload};
+    process.env.OMX_TEST_TMUX_BIN = input.tmuxBin;
+    process.env.PATH = ${JSON.stringify('__CHILD_PATH__')};
+    const { evaluatePaneInjectionReadiness } = await import(${JSON.stringify(params.moduleUrl)});
     const result = await evaluatePaneInjectionReadiness(input.paneTarget, input.options);
     process.stdout.write(JSON.stringify(result));
-  `;
+  `.replace('__CHILD_PATH__', `${params.fakeBinDir}:${process.env.PATH ?? ''}`);
   return spawnSync(process.execPath, ['--input-type=module', '-e', script], {
     encoding: 'utf-8',
-    env: {
-      ...process.env,
-      PATH: `${params.fakeBinDir}:${process.env.PATH ?? ''}`,
-    },
+    env: isolatedChildEnv(params.fakeBinDir),
   });
 }
 
@@ -98,6 +116,42 @@ describe('notify-hook team tmux guard bridge', () => {
       assert.equal(lines.length, 2);
       assert.match(lines[0], /send-keys -t %42 C-m/);
       assert.match(lines[1], /send-keys -t %42 C-m/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('queue-first submits with Tab before C-m when requested', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-tmux-guard-'));
+    const fakeBinDir = join(cwd, 'fake-bin');
+    const tmuxLogPath = join(cwd, 'tmux.log');
+
+    try {
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
+      await chmod(join(fakeBinDir, 'tmux'), 0o755);
+
+      const moduleUrl = new URL('../../../dist/scripts/notify-hook/team-tmux-guard.js', import.meta.url).href;
+      const result = runSendPaneInputInChild({
+        fakeBinDir,
+        moduleUrl,
+        paneTarget: '%42',
+        prompt: 'Read /tmp/team/mailbox/leader-fixed.json; new msg from worker-1. Review it; decide next step.',
+        submitKeyPresses: 2,
+        typePrompt: true,
+        queueFirstSubmit: true,
+      });
+
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.error, undefined);
+      assert.match(result.stdout, /"ok":true/);
+
+      const lines = (await readFile(tmuxLogPath, 'utf-8')).trim().split('\n').filter(Boolean);
+      assert.equal(lines.length, 4);
+      assert.match(lines[0], /send-keys -t %42 -l Read \/tmp\/team\/mailbox\/leader-fixed\.json/);
+      assert.match(lines[1], /send-keys -t %42 Tab/);
+      assert.match(lines[2], /send-keys -t %42 C-m/);
+      assert.match(lines[3], /send-keys -t %42 C-m/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
