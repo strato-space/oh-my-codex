@@ -71,9 +71,9 @@ function readJsonStringLiteral(raw, quoteIndex) {
   return null;
 }
 
-function extractTopLevelHookEventName(rawInput) {
+function extractTopLevelStringField(rawInput, fieldNames) {
   const raw = rawInput.slice(0, RAW_EVENT_SCAN_BYTES);
-  const wanted = new Set(['hook_event_name', 'hookEventName', 'event', 'name']);
+  const wanted = new Set(fieldNames);
   let depth = 0;
   let index = 0;
 
@@ -87,8 +87,7 @@ function extractTopLevelHookEventName(rawInput) {
       if (depth === 1 && raw[afterKey] === ':' && wanted.has(key.value)) {
         const valueStart = skipJsonWhitespace(raw, afterKey + 1);
         const value = readJsonStringLiteral(raw, valueStart);
-        const eventName = value?.value ?? null;
-        return CODEX_HOOK_EVENT_NAMES.has(eventName) ? eventName : null;
+        return value?.value ?? null;
       }
       continue;
     }
@@ -98,6 +97,11 @@ function extractTopLevelHookEventName(rawInput) {
   }
 
   return null;
+}
+
+function extractTopLevelHookEventName(rawInput) {
+  const eventName = extractTopLevelStringField(rawInput, ['hook_event_name', 'hookEventName', 'event', 'name']);
+  return CODEX_HOOK_EVENT_NAMES.has(eventName) ? eventName : null;
 }
 
 function detectStopHookInput(input) {
@@ -177,6 +181,71 @@ function readConfiguredLauncher() {
   return readPinnedLauncher() ?? { command: 'omx', argsPrefix: [] };
 }
 
+function readJsonFile(path) {
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function isTerminalOutcome(value) {
+  return ['finish', 'finished', 'complete', 'completed', 'done', 'blocked', 'blocked-on-user', 'blocked_on_user', 'failed', 'fail', 'error', 'cancelled', 'canceled', 'cancel', 'aborted', 'abort', 'userinterlude', 'user-interlude', 'interrupted', 'interrupt', 'askuserquestion', 'ask-user-question', 'askuser', 'question'].includes(String(value ?? '').trim().toLowerCase());
+}
+
+function isTerminalRunStateForMode(state, mode) {
+  if (!state) return false;
+  const runMode = String(state.mode ?? '').trim();
+  if (runMode && runMode !== mode) return false;
+  return isTerminalOutcome(state.outcome)
+    || isTerminalOutcome(state.run_outcome)
+    || isTerminalOutcome(state.lifecycle_outcome)
+    || isTerminalOutcome(state.terminal_outcome);
+}
+
+function listStateBaseDirs(cwd) {
+  const roots = [];
+  if (process.env.OMX_TEAM_STATE_ROOT?.trim()) roots.push(process.env.OMX_TEAM_STATE_ROOT.trim());
+  if (process.env.OMX_ROOT?.trim()) roots.push(join(process.env.OMX_ROOT.trim(), '.omx', 'state'));
+  if (process.env.OMX_STATE_ROOT?.trim()) roots.push(join(process.env.OMX_STATE_ROOT.trim(), '.omx', 'state'));
+  roots.push(join(cwd, '.omx', 'state'));
+  return [...new Set(roots)];
+}
+
+function isSafeSessionId(sessionId) {
+  return typeof sessionId === 'string'
+    && /^[A-Za-z0-9._:-]+$/.test(sessionId)
+    && !sessionId.includes('..')
+    && !sessionId.includes('/')
+    && !sessionId.includes('\\');
+}
+
+function hasActiveAutopilotStateForOversizedStop(input) {
+  const text = input.toString('utf8');
+  const cwd = extractTopLevelStringField(text, ['cwd']) || process.cwd();
+  const stateBaseDirs = listStateBaseDirs(cwd);
+  const sessionId = extractTopLevelStringField(text, ['session_id', 'sessionId'])
+    || process.env.OMX_SESSION_ID
+    || process.env.CODEX_SESSION_ID
+    || stateBaseDirs.map((stateDir) => readJsonFile(join(stateDir, 'session.json'))?.session_id).find((value) => typeof value === 'string' && value.trim() !== '');
+  if (!isSafeSessionId(sessionId)) return false;
+
+  const trimmedSessionId = sessionId.trim();
+  return stateBaseDirs.some((stateDir) => {
+    const sessionDir = join(stateDir, 'sessions', trimmedSessionId);
+    const terminalRunState = readJsonFile(join(sessionDir, 'run-state.json'));
+    if (isTerminalRunStateForMode(terminalRunState, 'autopilot')) return false;
+
+    const sessionState = readJsonFile(join(sessionDir, 'autopilot-state.json'));
+    return sessionState?.active === true;
+  });
+}
+
+function writeJsonNoop() {
+  process.stdout.write(`${JSON.stringify({})}\n`);
+  process.exitCode = 0;
+}
+
 async function main() {
   const { input, oversized, totalBytes } = await readBoundedStdin();
   const isStop = detectStopHookInput(input);
@@ -184,8 +253,12 @@ async function main() {
   if (oversized) {
     const message = `plugin hook stdin exceeded ${MAX_WRAPPER_STDIN_BYTES} bytes before launcher delegation; totalBytes>${totalBytes}`;
     if (isStop) {
-      console.error(`[oh-my-codex] ${message}`);
-      writeStopFallback('plugin_stop_hook_stdin_oversized', message);
+      if (hasActiveAutopilotStateForOversizedStop(input)) {
+        console.error(`[oh-my-codex] ${message}`);
+        writeStopFallback('plugin_stop_hook_stdin_oversized_active_workflow', message);
+        return;
+      }
+      writeJsonNoop();
       return;
     }
     console.error(`[oh-my-codex] ${message}`);
